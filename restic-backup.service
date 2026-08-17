@@ -1,0 +1,25 @@
+[Unit]
+Description=Restic backup of /opt/stacks to S3-compatible storage
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/restic/env
+# Explicit cache dir: restic EXITS WITH AN ERROR when no writable cache dir
+# exists, and ProtectHome=true hides $HOME. This line wins over the env file.
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+ExecStart=/opt/stacks/_backup/backup.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/stacks /etc/restic /var/cache/restic /tmp /var/tmp
+PrivateTmp=true
+# /run is read-only under ProtectSystem=strict; RuntimeDirectory gives us a
+# writable /run/restic for the flock file shared with manual runs/rotation.
+RuntimeDirectory=restic

@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily restic backup of /opt/stacks
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Spread nodes across a 2h window. FixedRandomDelay makes the offset stable
+# per machine (derived from machine-id), so many clients don't stampede a
+# single exit-node uplink at 03:00 sharp – including the catch-up burst after
+# a power event (Persistent=true fires missed runs at boot).
+RandomizedDelaySec=2h
+FixedRandomDelay=true
+Persistent=true
+
+[Install]
+WantedBy=timers.target
