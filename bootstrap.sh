@@ -25,7 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="/tmp/homelab-bootstrap-$(date +%Y%m%d-%H%M%S).log"
 NODE_ENV_DIR="/etc/homelab"
 NODE_ENV_FILE="$NODE_ENV_DIR/node.env"
-SCRIPT_VERSION="3"
+SCRIPT_VERSION="4"
+CLOUDFLARED_APT_LIST="/etc/apt/sources.list.d/cloudflared.list"
+CLOUDFLARED_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
 
 if [[ ! -r "$SCRIPT_DIR/lib.sh" ]]; then
   printf 'ERROR: lib.sh is required next to bootstrap.sh\n' >&2
@@ -70,6 +72,102 @@ need_root_or_sudo() {
   REAL_USER="${SUDO_USER:-$USER}"
 }
 
+cloudflared_cleanup_apt() {
+  # These paths are managed by this bootstrap, and must not survive a failed
+  # repository setup to break a later global apt update.
+  if ! $SUDO rm -f "$CLOUDFLARED_APT_LIST" "$CLOUDFLARED_KEYRING"; then
+    warn "Could not remove Cloudflare apt metadata; future apt updates may still need manual cleanup"
+  fi
+  return 0
+}
+
+cloudflared_source_suite() {
+  [[ -r "$CLOUDFLARED_APT_LIST" ]] || return 1
+  awk '$1 == "deb" { print $4; exit }' "$CLOUDFLARED_APT_LIST" 2>/dev/null
+}
+
+cloudflared_release_available() {
+  local suite="$1"
+  [[ -n "$suite" ]] || return 1
+  curl -fsSL --max-time 10 \
+    "https://pkg.cloudflare.com/cloudflared/dists/$suite/Release" \
+    >/dev/null 2>&1
+}
+
+cloudflared_is_usable() {
+  command -v cloudflared >/dev/null 2>&1 \
+    && cloudflared --version >/dev/null 2>&1
+}
+
+cloudflared_cleanup_stale_apt() {
+  local suite=""
+  if [[ -r "$CLOUDFLARED_APT_LIST" ]]; then
+    suite="$(cloudflared_source_suite || true)"
+    if ! cloudflared_release_available "$suite"; then
+      warn "Removing stale or unsupported Cloudflare apt source (suite=${suite:-unknown})"
+      cloudflared_cleanup_apt
+    fi
+  elif [[ -e "$CLOUDFLARED_APT_LIST" || -e "$CLOUDFLARED_KEYRING" ]]; then
+    warn "Removing unreadable or orphaned Cloudflare apt metadata"
+    cloudflared_cleanup_apt
+  fi
+}
+
+install_cloudflared_binary() {
+  local arch asset url tmp
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  case "$arch" in
+    amd64) asset="cloudflared-linux-amd64" ;;
+    i386)  asset="cloudflared-linux-386" ;;
+    arm64) asset="cloudflared-linux-arm64" ;;
+    armhf|armel) asset="cloudflared-linux-arm" ;;
+    *)
+      warn "No official cloudflared binary mapping for architecture '$arch'; skipping"
+      return 1
+      ;;
+  esac
+
+  url="https://github.com/cloudflare/cloudflared/releases/latest/download/$asset"
+  if ! tmp="$(mktemp)"; then
+    warn "Could not create a temporary file for the cloudflared binary"
+    return 1
+  fi
+  if ! curl -fsSL --retry 2 "$url" -o "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! $SUDO install -m 0755 "$tmp" /usr/local/bin/cloudflared; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  cloudflared_is_usable
+}
+
+install_cloudflared_apt() {
+  if ! curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | $SUDO tee "$CLOUDFLARED_KEYRING" >/dev/null; then
+    cloudflared_cleanup_apt
+    return 1
+  fi
+  # Cloudflare documents the "any" suite for all Debian-based distributions.
+  if ! printf '%s\n' \
+    "deb [signed-by=$CLOUDFLARED_KEYRING] https://pkg.cloudflare.com/cloudflared any main" \
+    | $SUDO tee "$CLOUDFLARED_APT_LIST" >/dev/null; then
+    cloudflared_cleanup_apt
+    return 1
+  fi
+  if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+    cloudflared_cleanup_apt
+    return 1
+  fi
+  if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared; then
+    cloudflared_cleanup_apt
+    return 1
+  fi
+  cloudflared_is_usable
+}
+
 GENERIC_NODE_NAMES="ubuntu debian localhost server client homelab node vps host linux default unknown"
 
 # Normalize to lowercase, require DNS-label-safe, reject generic names.
@@ -89,7 +187,8 @@ ROLE=""                       # server | client
 NODE_NAME=""
 USE_EXIT_NODE=""              # for clients: name/IP of exit node
 ADVERTISE_EXIT_NODE="false"   # for servers
-INSTALL_CLOUDFLARED="false"
+INSTALL_CLOUDFLARED="false"  # successfully applied state
+CLOUDFLARED_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 KEEP_PUBLIC_SSH="true"        # safety default – only tighten later
 TS_AUTHKEY="${TS_AUTHKEY:-}"  # optional non-interactive Tailscale join
 EXIT_NODE_LAN_ACCESS="true"   # homelab default: stay reachable from LAN
@@ -108,7 +207,7 @@ PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP=""
 PERSISTED_KEEP_PUBLIC_SSH=""
 PERSISTED_TAILSCALE_FIREWALL_VERIFIED=""
 
-# ---------- Persisted state from a previous run (CLI flags override it) ----------
+# ---------- Persisted state from a previous run -------------------------------
 # Needs $SUDO: node.env is 0600 root, and non-root invocations must not die here.
 need_root_or_sudo
 if [[ -f "$NODE_ENV_FILE" ]]; then
@@ -145,6 +244,11 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   USE_EXIT_NODE="$PERSISTED_USE_EXIT_NODE"
   ADVERTISE_EXIT_NODE="${PERSISTED_ADVERTISE_EXIT_NODE:-false}"
   INSTALL_CLOUDFLARED="${PERSISTED_INSTALL_CLOUDFLARED:-false}"
+  if [[ "$INSTALL_CLOUDFLARED" == "true" ]] \
+    && ! cloudflared_is_usable; then
+    warn "Persisted cloudflared state was true, but the command is missing; clearing stale install intent"
+    INSTALL_CLOUDFLARED="false"
+  fi
   EXIT_NODE_LAN_ACCESS="${PERSISTED_EXIT_NODE_LAN_ACCESS:-true}"
   DIRECT_PUBLIC_IP_AT_SETUP="$PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP"
   KEEP_PUBLIC_SSH="${PERSISTED_KEEP_PUBLIC_SSH:-}"
@@ -200,7 +304,7 @@ for arg in "$@"; do
     --node-name=*)         NODE_NAME="${arg#*=}"; FLAG_NODE_NAME_SET="true" ;;
     --advertise-exit-node) ADVERTISE_EXIT_NODE="true" ;;
     --use-exit-node=*)     USE_EXIT_NODE="${arg#*=}" ;;
-    --install-cloudflared) INSTALL_CLOUDFLARED="true" ;;
+    --install-cloudflared) CLOUDFLARED_REQUESTED_THIS_RUN="true" ;;
     --no-public-ssh)       KEEP_PUBLIC_SSH="false" ;;
     --public-ssh)          KEEP_PUBLIC_SSH="true" ;;
     --ts-authkey=*)        TS_AUTHKEY="${arg#*=}" ;;
@@ -269,10 +373,14 @@ if ! confirm "Proceed with bootstrap?"; then
   exit 0
 fi
 
+# A failed older run may have left an unsupported suite behind. Remove it
+# before the first global apt update, even when this run has no cloudflared flag.
+cloudflared_cleanup_stale_apt
+
 # ---------- 1. Base packages ----------
 info "Installing base packages..."
 $SUDO apt-get update -qq
-$SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
   curl ca-certificates gnupg lsb-release ufw jq bc restic openssl \
   > >(tee -a "$LOG_FILE") 2>&1 || {
     error "Failed to install base packages. Check the log: $LOG_FILE"
@@ -563,18 +671,29 @@ write_node_env
 info "Persisted identity and firewall state to $NODE_ENV_FILE"
 
 # ---------- 5. Role-specific extras ----------
-if [[ "$ROLE" == "server" && "$INSTALL_CLOUDFLARED" == "true" ]]; then
+if [[ "$ROLE" == "server" && "$CLOUDFLARED_REQUESTED_THIS_RUN" == "true" ]]; then
   info "Installing cloudflared..."
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    # Official package for Debian/Ubuntu
-    curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | $SUDO tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
-      | $SUDO tee /etc/apt/sources.list.d/cloudflared.list
-    $SUDO apt-get update -qq
-    $SUDO apt-get install -y cloudflared
+  if cloudflared_is_usable; then
+    INSTALL_CLOUDFLARED="true"
+  elif install_cloudflared_apt; then
+    INSTALL_CLOUDFLARED="true"
+  else
+    warn "Cloudflare apt installation failed; trying the official cloudflared binary"
+    cloudflared_cleanup_apt
+    if install_cloudflared_binary; then
+      INSTALL_CLOUDFLARED="true"
+    else
+      INSTALL_CLOUDFLARED="false"
+      cloudflared_cleanup_apt
+      warn "cloudflared could not be installed; continuing without it. Re-run with --install-cloudflared after fixing the package or network path."
+    fi
   fi
-  info "cloudflared installed. You still need to run 'cloudflared tunnel login' and create a tunnel manually."
-  info "See: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/"
+  # Persist only the applied result, never a failed current-run request.
+  write_node_env
+  if [[ "$INSTALL_CLOUDFLARED" == "true" ]]; then
+    info "cloudflared installed. You still need to run 'cloudflared tunnel login' and create a tunnel manually."
+    info "See: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/"
+  fi
 fi
 
 # ---------- 6. Restic setup ----------

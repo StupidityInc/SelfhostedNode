@@ -117,7 +117,7 @@ Node-local state that does not live in this repo:
 
 | Path                        | Contents                                     |
 |-----------------------------|----------------------------------------------|
-| `/etc/homelab/node.env`     | ROLE, stable identity, wanted/applied exit-node state, lockdown metadata |
+| `/etc/homelab/node.env`     | ROLE, stable identity, applied tunnel/exit-node state, lockdown metadata |
 | `/etc/restic/env`           | S3 credentials, repository, cache dir (0600) |
 | `/etc/restic/password`      | Repository password (0600)                   |
 | `/etc/restic/recovery-key.present` | Recovery-key existence marker, never the secret |

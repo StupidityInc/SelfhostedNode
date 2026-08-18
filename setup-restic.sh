@@ -152,12 +152,12 @@ fi
 if ! command -v restic >/dev/null 2>&1; then
   echo "Installing restic..."
   $SUDO apt-get update -qq
-  $SUDO apt-get install -y restic
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y restic
 fi
 if ! command -v openssl >/dev/null 2>&1; then
   echo "Installing openssl (needed for password generation)..."
   $SUDO apt-get update -qq
-  $SUDO apt-get install -y openssl
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y openssl
 fi
 restic version
 
