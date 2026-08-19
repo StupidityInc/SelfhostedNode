@@ -8,6 +8,7 @@ Opinionated bootstrap for personal homelab nodes that use:
 - UFW default-deny with Tailscale interface allowed
 - Optional Cloudflare Tunnel on server nodes
 - Optional Tailscale exit-node routing for pure compute clients
+- Optional Beszel agent connected outbound to a manually managed hub
 
 ## Roles
 
@@ -53,6 +54,56 @@ removing public SSH. For unattended restic setup export `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `BUCKET` (and optionally
 `RESTIC_PASSWORD`; otherwise one is generated and printed once. To add a
 recovery key non-interactively, also provide `RESTIC_RECOVERY_PASSWORD_FILE`.
+
+### Optional Beszel agent
+
+Beszel is opt-in. Bootstrap installs only the agent under
+`/opt/stacks/beszel-agent/`; it never installs the hub or Uptime Kuma.
+
+Set up the hub manually once on the monitoring node, commonly under
+`/opt/stacks/beszel/`. Keep its UI reachable through Tailscale only. In the
+hub UI, use **Add System** (or create a universal token) and copy the agent's
+public `KEY` and `TOKEN`.
+
+Interactive bootstrap asks `Install Beszel agent? [y/N]`, then prompts for the
+hub URL, public key, and token:
+
+```bash
+sudo ./bootstrap.sh --role=client --node-name=compute-1
+```
+
+For non-interactive use, pass `--beszel-agent` and the required values. The hub
+URL must be a Tailscale IP or a hostname that resolves to a Tailscale address:
+
+```bash
+sudo env \
+  BESZEL_HUB_URL="http://vps-1:8090" \
+  BESZEL_AGENT_KEY="ssh-ed25519 AAAA..." \
+  BESZEL_AGENT_TOKEN="..." \
+  ./bootstrap.sh --yes --role=client --node-name=compute-1 --beszel-agent
+```
+
+`BESZEL_SYSTEM_NAME` is optional and defaults to `NODE_NAME`. Loopback or
+public hub URLs are rejected unless `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` is
+explicitly set for a hub running on this same host.
+
+The generated `/opt/stacks/beszel-agent/.env` is root-owned with mode `600`.
+It is intentionally inside `/opt/stacks`, so it is included in the encrypted
+restic backup; never commit it or place real credentials in
+`beszel-agent/.env.example`. The Compose project uses host networking for
+interface statistics, listens only on `127.0.0.1:45876`, disables the inbound
+SSH mode, and publishes no Docker ports or UFW rules.
+
+Verify after bootstrap:
+
+```bash
+sudo docker ps --filter name=beszel-agent
+sudo docker compose --env-file /opt/stacks/beszel-agent/.env \
+  -f /opt/stacks/beszel-agent/docker-compose.yml ps
+```
+
+The agent should then appear healthy in the manually managed hub UI. Install
+Uptime Kuma manually on the monitoring node only; it is not automated here.
 
 ## How the safe ordering works
 
@@ -108,6 +159,7 @@ firewall rules. Instead:
 | `restic-backup.timer`       | Daily timer (03:00 + stable per-node offset) |
 | `change-restic-password.sh` | Safe restic password rotation                |
 | `check-node.sh`             | Health + exit-node + backup-freshness checker|
+| `beszel-agent/`             | Beszel agent Compose template and env example  |
 | `RESTORE.md`                | Self-describing recovery instructions        |
 | `CHANGES.md`                | What was hardened and why                    |
 | `TESTING.md`                | Throwaway-VPS verification plan              |
@@ -150,7 +202,8 @@ makes all missed runs fire at boot.
   `setup-restic.sh` offers this interactively and accepts
   `RESTIC_RECOVERY_PASSWORD_FILE` non-interactively. Password rotation refuses
   to proceed until a recovery key is recorded and successfully verified.
-- Secrets never live inside `/opt/stacks` (so they are not part of the backup).
+- Restic credentials remain under `/etc/restic`; the opt-in Beszel `.env` is a
+  deliberate root-only exception under `/opt/stacks` and is encrypted by restic.
 
 ## Typical multi-node flow
 

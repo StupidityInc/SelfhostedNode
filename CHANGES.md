@@ -1,5 +1,19 @@
 # Changes
 
+## 2026-08-19
+
+Added an opt-in Beszel agent deployment:
+
+- `bootstrap.sh --beszel-agent` (or the interactive opt-in) requires the hub
+  URL, public agent key, and token before writing the runtime `.env`.
+- The agent-only Compose project lives under `/opt/stacks/beszel-agent/`, uses
+  host networking for host statistics, listens on loopback, disables inbound
+  SSH mode, and publishes no Docker ports.
+- The generated `.env` is root-owned with mode `600`; `INSTALL_BESZEL_AGENT=true`
+  is persisted only after a running container is verified.
+- The hub and Uptime Kuma remain manual, with the hub UI intended for Tailscale
+  access only.
+
 ## 2026-08-18
 
 Closed the residual High issues from the second hardening review:

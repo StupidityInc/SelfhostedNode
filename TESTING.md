@@ -256,3 +256,88 @@ stat -c '%U:%G %a' /opt/stacks/<known-data-file>
 Expect: bootstrap keeps the existing restic configuration, and restored stack
 ownership is unchanged. There must be no recursive ownership rewrite in the
 restore procedure.
+
+## 13. Optional Beszel agent
+
+Prerequisites: a manually running Beszel hub on the monitoring node, with its
+UI reachable through Tailscale, and a system `KEY` plus `TOKEN` copied from the
+hub UI. Uptime Kuma is not part of this test; install it manually on the
+monitoring node only.
+
+### 13a. Opt-in and preflight failures
+
+Run a normal non-interactive bootstrap without `--beszel-agent`:
+
+```bash
+sudo ./bootstrap.sh --yes --role=client --node-name=beszel-test
+```
+
+Expect: no `/opt/stacks/beszel-agent/` is created and `node.env` does not
+record `INSTALL_BESZEL_AGENT=true`.
+
+Then test missing required values:
+
+```bash
+sudo env BESZEL_HUB_URL="http://100.64.0.1:8090" \
+  BESZEL_AGENT_KEY="test-key" \
+  ./bootstrap.sh --yes --role=client --node-name=beszel-test --beszel-agent
+```
+
+Expect: bootstrap exits non-zero before creating the Beszel directory or `.env`
+and clearly reports the missing token. No half-empty secret file is left behind.
+
+Then repeat with all required values but a public address:
+
+```bash
+sudo env \
+  BESZEL_HUB_URL="http://203.0.113.10:8090" \
+  BESZEL_AGENT_KEY="test-key" \
+  BESZEL_AGENT_TOKEN="test-token" \
+  ./bootstrap.sh --yes --role=client --node-name=beszel-test --beszel-agent
+```
+
+Expect: bootstrap rejects the public hub URL before creating the Beszel
+directory or `.env`.
+
+### 13b. Successful agent setup
+
+Use the real values from the manually managed hub:
+
+```bash
+sudo env \
+  BESZEL_HUB_URL="http://<tailscale-name-or-100.x-ip>:8090" \
+  BESZEL_AGENT_KEY="<public-key-from-hub>" \
+  BESZEL_AGENT_TOKEN="<token-from-hub>" \
+  ./bootstrap.sh --yes --role=client --node-name=beszel-test --beszel-agent
+```
+
+Expect:
+
+- `/opt/stacks/beszel-agent/docker-compose.yml` and `.env` exist.
+- `stat -c '%U:%G %a' /opt/stacks/beszel-agent/.env` prints `root:root 600`.
+- `node.env` contains `INSTALL_BESZEL_AGENT=true` only after the container is running.
+- `docker ps --filter name=beszel-agent` shows a running container.
+- `docker inspect -f '{{.HostConfig.NetworkMode}}' beszel-agent` prints `host`.
+- The container has no Docker-published port mapping and `ufw status` has no new Beszel rule.
+- The agent appears healthy in the hub UI and uses the node name when no display name was supplied.
+- The bootstrap log contains none of the supplied token text.
+
+### 13c. Re-run safety
+
+Re-run without `--beszel-agent` and verify the existing healthy container stays
+running and `beszel_agent_data` is unchanged. Re-run with `--beszel-agent` only
+when intentionally changing its configuration; Compose must preserve the data
+directory and `INSTALL_BESZEL_AGENT=true` must remain recorded only after a
+successful start.
+
+For a same-host hub only, verify the explicit exception:
+
+```bash
+sudo env BESZEL_ALLOW_SAME_HOST_HUB_URL=true \
+  BESZEL_HUB_URL="http://127.0.0.1:8090" \
+  BESZEL_AGENT_KEY="<public-key-from-hub>" \
+  BESZEL_AGENT_TOKEN="<token-from-hub>" \
+  ./bootstrap.sh --yes --role=server --node-name=beszel-test --beszel-agent
+```
+
+Do not use that override for a hub on another node.

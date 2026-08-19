@@ -10,6 +10,7 @@ set -euo pipefail
 #   - UFW hardening (default deny, Tailscale-only access)
 #   - Restic → S3-compatible backup (one repo per node)
 #   - Optional Cloudflare Tunnel on server nodes
+#   - Optional Beszel agent connected to a manually managed hub
 #
 # Design goals:
 #   - Safe ordering (minimize lockout risk):
@@ -25,9 +26,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="/tmp/homelab-bootstrap-$(date +%Y%m%d-%H%M%S).log"
 NODE_ENV_DIR="/etc/homelab"
 NODE_ENV_FILE="$NODE_ENV_DIR/node.env"
-SCRIPT_VERSION="4"
+SCRIPT_VERSION="5"
 CLOUDFLARED_APT_LIST="/etc/apt/sources.list.d/cloudflared.list"
 CLOUDFLARED_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
+BESZEL_AGENT_STACK_DIR="/opt/stacks/beszel-agent"
+BESZEL_AGENT_COMPOSE_TEMPLATE="$SCRIPT_DIR/beszel-agent/docker-compose.yml"
 
 if [[ ! -r "$SCRIPT_DIR/lib.sh" ]]; then
   printf 'ERROR: lib.sh is required next to bootstrap.sh\n' >&2
@@ -168,6 +171,216 @@ install_cloudflared_apt() {
   cloudflared_is_usable
 }
 
+beszel_same_host_override() {
+  case "${BESZEL_ALLOW_SAME_HOST_HUB_URL,,}" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+beszel_ipv4_is_valid() {
+  local ip="$1" a b c d
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 ))
+}
+
+beszel_ipv4_is_tailnet() {
+  local ip="$1" a b c d
+  beszel_ipv4_is_valid "$ip" || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  (( a == 100 && b >= 64 && b <= 127 ))
+}
+
+beszel_parse_hub_url() {
+  local url="$1" authority port
+  BESZEL_HUB_HOST=""
+  BESZEL_HUB_HOST_IS_IPV4="false"
+  BESZEL_HUB_HOST_IS_IPV6="false"
+
+  if [[ ! "$url" =~ ^https?://([^/?#]+)/*$ ]]; then
+    return 1
+  fi
+  authority="${BASH_REMATCH[1]}"
+  [[ "$authority" != *"@"* ]] || return 1
+
+  if [[ "$authority" =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]+))?$ ]]; then
+    BESZEL_HUB_HOST="${BASH_REMATCH[1]}"
+    BESZEL_HUB_HOST_IS_IPV6="true"
+    port="${BASH_REMATCH[3]:-}"
+  elif [[ "$authority" =~ ^([A-Za-z0-9][A-Za-z0-9.-]*)(:([0-9]+))?$ ]]; then
+    BESZEL_HUB_HOST="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+    if [[ "$BESZEL_HUB_HOST" =~ ^[0-9.]+$ ]]; then
+      beszel_ipv4_is_valid "$BESZEL_HUB_HOST" || return 1
+      BESZEL_HUB_HOST_IS_IPV4="true"
+    fi
+  else
+    return 1
+  fi
+
+  if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
+    return 1
+  fi
+  [[ -n "$BESZEL_HUB_HOST" ]]
+}
+
+beszel_validate_hub_url_syntax() {
+  local host
+  beszel_parse_hub_url "$BESZEL_HUB_URL" || return 1
+  host="$BESZEL_HUB_HOST"
+
+  if beszel_same_host_override; then
+    return 0
+  fi
+  if [[ "$BESZEL_HUB_HOST_IS_IPV4" == "true" ]]; then
+    beszel_ipv4_is_tailnet "$host"
+    return
+  fi
+  if [[ "$BESZEL_HUB_HOST_IS_IPV6" == "true" ]]; then
+    [[ "$host" == fd7a:115c:a1e0:* ]]
+    return
+  fi
+  case "${host,,}" in
+    localhost|localhost.localdomain|0.0.0.0) return 1 ;;
+  esac
+  return 0
+}
+
+beszel_validate_hub_url_reachability() {
+  local resolved address
+  beszel_parse_hub_url "$BESZEL_HUB_URL" || return 1
+  if beszel_same_host_override; then
+    warn "BESZEL_HUB_URL uses the explicit same-host override; verify that the hub listens on this host"
+    return 0
+  fi
+  if [[ "$BESZEL_HUB_HOST_IS_IPV4" == "true" ]]; then
+    beszel_ipv4_is_tailnet "$BESZEL_HUB_HOST"
+    return
+  fi
+  if [[ "$BESZEL_HUB_HOST_IS_IPV6" == "true" ]]; then
+    [[ "$BESZEL_HUB_HOST" == fd7a:115c:a1e0:* ]]
+    return
+  fi
+
+  resolved="$(getent ahostsv4 "$BESZEL_HUB_HOST" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+  [[ -n "$resolved" ]] || return 1
+  while IFS= read -r address; do
+    if beszel_ipv4_is_tailnet "$address"; then
+      return 0
+    fi
+  done <<<"$resolved"
+  return 1
+}
+
+beszel_collect_config() {
+  if is_interactive; then
+    if [[ -z "$BESZEL_HUB_URL" ]]; then
+      read -r -p "Beszel hub URL (Tailscale address): " BESZEL_HUB_URL
+    fi
+    if [[ -z "$BESZEL_AGENT_KEY" ]]; then
+      read -r -p "Beszel agent public key: " BESZEL_AGENT_KEY
+    fi
+    if [[ -z "$BESZEL_AGENT_TOKEN" ]]; then
+      read -r -s -p "Beszel agent token: " BESZEL_AGENT_TOKEN
+      echo
+    fi
+  fi
+
+  if [[ -z "$BESZEL_HUB_URL" || -z "$BESZEL_AGENT_KEY" || -z "$BESZEL_AGENT_TOKEN" ]]; then
+    error "Beszel agent requested but BESZEL_HUB_URL, BESZEL_AGENT_KEY, and BESZEL_AGENT_TOKEN are all required"
+  fi
+  BESZEL_SYSTEM_NAME="${BESZEL_SYSTEM_NAME:-$NODE_NAME}"
+  if [[ "$BESZEL_HUB_URL$BESZEL_AGENT_KEY$BESZEL_AGENT_TOKEN$BESZEL_SYSTEM_NAME" == *$'\n'* \
+    || "$BESZEL_HUB_URL$BESZEL_AGENT_KEY$BESZEL_AGENT_TOKEN$BESZEL_SYSTEM_NAME" == *$'\r'* ]]; then
+    error "Beszel configuration values must be single-line"
+  fi
+  if ! beszel_validate_hub_url_syntax; then
+    error "BESZEL_HUB_URL must use a Tailscale IP (100.64.0.0/10), Tailscale-resolving hostname, or the explicit same-host override"
+  fi
+}
+
+configure_beszel_agent() {
+  local compose_tmp env_tmp container_running
+
+  if [[ ! -r "$BESZEL_AGENT_COMPOSE_TEMPLATE" ]]; then
+    warn "Beszel agent Compose template is missing: $BESZEL_AGENT_COMPOSE_TEMPLATE"
+    return 1
+  fi
+  if ! beszel_validate_hub_url_reachability; then
+    warn "BESZEL_HUB_URL does not resolve to a Tailscale address from this node: $BESZEL_HUB_URL"
+    warn "Use a MagicDNS name or 100.x Tailscale address, or explicitly set BESZEL_ALLOW_SAME_HOST_HUB_URL=true for a same-host hub"
+    return 1
+  fi
+  if ! $SUDO docker compose version >/dev/null 2>&1; then
+    warn "Docker Compose is required to deploy the Beszel agent"
+    return 1
+  fi
+
+  if ! $SUDO test -d "$BESZEL_AGENT_STACK_DIR"; then
+    if ! $SUDO mkdir -p "$BESZEL_AGENT_STACK_DIR" \
+      || ! $SUDO chown root:root "$BESZEL_AGENT_STACK_DIR" \
+      || ! $SUDO chmod 700 "$BESZEL_AGENT_STACK_DIR"; then
+      warn "Could not create the root-only Beszel agent directory"
+      return 1
+    fi
+  else
+    # Tighten only the project directory itself; never change data ownership.
+    if ! $SUDO chmod 700 "$BESZEL_AGENT_STACK_DIR"; then
+      warn "Could not protect the existing Beszel agent directory"
+      return 1
+    fi
+  fi
+
+  if ! compose_tmp="$($SUDO mktemp "$BESZEL_AGENT_STACK_DIR/.docker-compose.yml.XXXXXX")"; then
+    warn "Could not create a temporary Beszel Compose file"
+    return 1
+  fi
+  if ! $SUDO cp "$BESZEL_AGENT_COMPOSE_TEMPLATE" "$compose_tmp" \
+    || ! $SUDO chown root:root "$compose_tmp" \
+    || ! $SUDO chmod 644 "$compose_tmp" \
+    || ! $SUDO mv "$compose_tmp" "$BESZEL_AGENT_STACK_DIR/docker-compose.yml"; then
+    $SUDO rm -f "$compose_tmp" || true
+    warn "Could not install the Beszel agent Compose file"
+    return 1
+  fi
+
+  if ! env_tmp="$($SUDO mktemp "$BESZEL_AGENT_STACK_DIR/.env.XXXXXX")"; then
+    warn "Could not create a temporary Beszel environment file"
+    return 1
+  fi
+  if ! {
+    homelab_format_kv BESZEL_HUB_URL "$BESZEL_HUB_URL"
+    homelab_format_kv BESZEL_AGENT_KEY "$BESZEL_AGENT_KEY"
+    homelab_format_kv BESZEL_AGENT_TOKEN "$BESZEL_AGENT_TOKEN"
+    homelab_format_kv BESZEL_SYSTEM_NAME "$BESZEL_SYSTEM_NAME"
+  } | $SUDO tee "$env_tmp" >/dev/null; then
+    $SUDO rm -f "$env_tmp" || true
+    warn "Could not write the Beszel environment file"
+    return 1
+  fi
+  if ! $SUDO chown root:root "$env_tmp" \
+    || ! $SUDO chmod 600 "$env_tmp" \
+    || ! $SUDO mv "$env_tmp" "$BESZEL_AGENT_STACK_DIR/.env"; then
+    $SUDO rm -f "$env_tmp" || true
+    warn "Could not install the protected Beszel environment file"
+    return 1
+  fi
+
+  info "Starting the Beszel agent (credentials are not logged)..."
+  if ! $SUDO docker compose --env-file "$BESZEL_AGENT_STACK_DIR/.env" \
+    -f "$BESZEL_AGENT_STACK_DIR/docker-compose.yml" up -d; then
+    warn "Beszel agent Compose startup failed; persisted install state was not changed"
+    return 1
+  fi
+  container_running="$($SUDO docker inspect -f '{{.State.Running}}' beszel-agent 2>/dev/null || true)"
+  if [[ "$container_running" != "true" ]]; then
+    warn "Beszel agent container is not running after Compose startup"
+    return 1
+  fi
+  return 0
+}
+
 GENERIC_NODE_NAMES="ubuntu debian localhost server client homelab node vps host linux default unknown"
 
 # Normalize to lowercase, require DNS-label-safe, reject generic names.
@@ -189,8 +402,15 @@ USE_EXIT_NODE=""              # for clients: name/IP of exit node
 ADVERTISE_EXIT_NODE="false"   # for servers
 INSTALL_CLOUDFLARED="false"  # successfully applied state
 CLOUDFLARED_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
+INSTALL_BESZEL_AGENT="false"  # successfully applied state
+BESZEL_AGENT_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 KEEP_PUBLIC_SSH="true"        # safety default – only tighten later
 TS_AUTHKEY="${TS_AUTHKEY:-}"  # optional non-interactive Tailscale join
+BESZEL_HUB_URL="${BESZEL_HUB_URL:-}"
+BESZEL_AGENT_KEY="${BESZEL_AGENT_KEY:-}"
+BESZEL_AGENT_TOKEN="${BESZEL_AGENT_TOKEN:-}"
+BESZEL_SYSTEM_NAME="${BESZEL_SYSTEM_NAME:-}"
+BESZEL_ALLOW_SAME_HOST_HUB_URL="${BESZEL_ALLOW_SAME_HOST_HUB_URL:-false}"
 EXIT_NODE_LAN_ACCESS="true"   # homelab default: stay reachable from LAN
 DIRECT_PUBLIC_IP_AT_SETUP=""
 FLAG_ROLE_SET="false"
@@ -202,6 +422,7 @@ PERSISTED_USE_EXIT_NODE=""
 PERSISTED_EXIT_NODE_APPLIED=""
 PERSISTED_ADVERTISE_EXIT_NODE=""
 PERSISTED_INSTALL_CLOUDFLARED=""
+PERSISTED_INSTALL_BESZEL_AGENT=""
 PERSISTED_EXIT_NODE_LAN_ACCESS=""
 PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP=""
 PERSISTED_KEEP_PUBLIC_SSH=""
@@ -218,6 +439,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   EXIT_NODE_APPLIED=""
   ADVERTISE_EXIT_NODE=""
   INSTALL_CLOUDFLARED=""
+  INSTALL_BESZEL_AGENT=""
   EXIT_NODE_LAN_ACCESS=""
   DIRECT_PUBLIC_IP_AT_SETUP=""
   KEEP_PUBLIC_SSH=""
@@ -231,6 +453,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   PERSISTED_EXIT_NODE_APPLIED="$EXIT_NODE_APPLIED"
   PERSISTED_ADVERTISE_EXIT_NODE="$ADVERTISE_EXIT_NODE"
   PERSISTED_INSTALL_CLOUDFLARED="$INSTALL_CLOUDFLARED"
+  PERSISTED_INSTALL_BESZEL_AGENT="$INSTALL_BESZEL_AGENT"
   PERSISTED_EXIT_NODE_LAN_ACCESS="$EXIT_NODE_LAN_ACCESS"
   PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP="$DIRECT_PUBLIC_IP_AT_SETUP"
   PERSISTED_KEEP_PUBLIC_SSH="$KEEP_PUBLIC_SSH"
@@ -248,6 +471,13 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
     && ! cloudflared_is_usable; then
     warn "Persisted cloudflared state was true, but the command is missing; clearing stale install intent"
     INSTALL_CLOUDFLARED="false"
+  fi
+  INSTALL_BESZEL_AGENT="${PERSISTED_INSTALL_BESZEL_AGENT:-false}"
+  if [[ "$INSTALL_BESZEL_AGENT" == "true" ]] \
+    && { ! $SUDO test -f "$BESZEL_AGENT_STACK_DIR/docker-compose.yml" \
+      || ! $SUDO test -f "$BESZEL_AGENT_STACK_DIR/.env"; }; then
+    warn "Persisted Beszel agent state was true, but its Compose or .env file is missing; clearing stale install intent"
+    INSTALL_BESZEL_AGENT="false"
   fi
   EXIT_NODE_LAN_ACCESS="${PERSISTED_EXIT_NODE_LAN_ACCESS:-true}"
   DIRECT_PUBLIC_IP_AT_SETUP="$PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP"
@@ -281,6 +511,7 @@ Options:
                              Applied LAST, after UFW/restic/connectivity are
                              verified, with probe + automatic rollback.
   --install-cloudflared      (server) Install and prepare Cloudflare Tunnel
+  --beszel-agent             Opt in to an agent connected to a manual Beszel hub
   --no-public-ssh            After Tailscale is verified, remove public SSH rules.
                               In non-interactive mode this flag IS the confirmation.
   --public-ssh               Explicitly reopen/keep public SSH (overrides lockdown).
@@ -291,6 +522,12 @@ Options:
 
 Environment:
   TS_AUTHKEY                 Same as --ts-authkey
+  BESZEL_HUB_URL             Tailscale-reachable Beszel hub URL (required with --beszel-agent)
+  BESZEL_AGENT_KEY           Beszel public agent key (required with --beszel-agent)
+  BESZEL_AGENT_TOKEN         Beszel agent token (required with --beszel-agent)
+  BESZEL_SYSTEM_NAME         Optional Beszel display name (defaults to --node-name)
+  BESZEL_ALLOW_SAME_HOST_HUB_URL=true
+                             Explicitly allow a non-Tailscale hub URL for a same-host hub
   HOMELAB_NONINTERACTIVE=1   Same as --yes
 
 State persisted across runs: $NODE_ENV_FILE
@@ -305,6 +542,7 @@ for arg in "$@"; do
     --advertise-exit-node) ADVERTISE_EXIT_NODE="true" ;;
     --use-exit-node=*)     USE_EXIT_NODE="${arg#*=}" ;;
     --install-cloudflared) CLOUDFLARED_REQUESTED_THIS_RUN="true" ;;
+    --beszel-agent)        BESZEL_AGENT_REQUESTED_THIS_RUN="true" ;;
     --no-public-ssh)       KEEP_PUBLIC_SSH="false" ;;
     --public-ssh)          KEEP_PUBLIC_SSH="true" ;;
     --ts-authkey=*)        TS_AUTHKEY="${arg#*=}" ;;
@@ -367,6 +605,18 @@ info "Role      : $ROLE"
 info "Node name : $NODE_NAME"
 info "Log file  : $LOG_FILE"
 echo
+
+if [[ "$INSTALL_BESZEL_AGENT" != "true" \
+  && "$BESZEL_AGENT_REQUESTED_THIS_RUN" != "true" \
+  && is_interactive ]]; then
+  if confirm "Install Beszel agent?"; then
+    BESZEL_AGENT_REQUESTED_THIS_RUN="true"
+  fi
+fi
+if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
+  beszel_collect_config
+  info "Beszel agent requested; it will be configured after Tailscale is ready"
+fi
 
 if ! confirm "Proceed with bootstrap?"; then
   info "Aborted by user"
@@ -657,6 +907,7 @@ write_node_env() {
     homelab_format_kv EXIT_NODE_APPLIED "$EXIT_NODE_APPLIED"
     homelab_format_kv ADVERTISE_EXIT_NODE "$ADVERTISE_EXIT_NODE"
     homelab_format_kv INSTALL_CLOUDFLARED "$INSTALL_CLOUDFLARED"
+    homelab_format_kv INSTALL_BESZEL_AGENT "$INSTALL_BESZEL_AGENT"
     homelab_format_kv EXIT_NODE_LAN_ACCESS "$EXIT_NODE_LAN_ACCESS"
     homelab_format_kv DIRECT_PUBLIC_IP_AT_SETUP "$DIRECT_PUBLIC_IP_AT_SETUP"
     homelab_format_kv KEEP_PUBLIC_SSH "$KEEP_PUBLIC_SSH"
@@ -807,7 +1058,19 @@ elif [[ "$ROLE" == "client" && -z "$USE_EXIT_NODE" ]]; then
   warn "This node will have Tailscale but no forced exit-node routing."
 fi
 
-# ---------- 9. Final notes ----------
+# ---------- 9. Optional Beszel agent ------------------------------------------
+if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
+  info "Configuring Beszel agent under $BESZEL_AGENT_STACK_DIR..."
+  if ! configure_beszel_agent; then
+    error "Beszel agent configuration failed; INSTALL_BESZEL_AGENT was not changed. Fix the issue and re-run with --beszel-agent."
+  fi
+  # Persist only after the Compose project and running container were verified.
+  INSTALL_BESZEL_AGENT="true"
+  write_node_env
+  info "Beszel agent configured successfully"
+fi
+
+# ---------- 10. Final notes ----------
 cat <<EOF
 
 =============================================================================
@@ -834,6 +1097,18 @@ Next steps:
        # Public IP should be the exit node's public IP
   6. Consider removing public SSH later if you kept it open:
        sudo $0 --no-public-ssh   # after confirming Tailscale SSH works
+
+EOF
+if [[ "$INSTALL_BESZEL_AGENT" == "true" ]]; then
+  cat <<EOF
+Beszel agent:
+   sudo docker compose --env-file /opt/stacks/beszel-agent/.env \\
+     -f /opt/stacks/beszel-agent/docker-compose.yml ps
+  Confirm the agent appears healthy in the manually managed Beszel hub UI.
+
+EOF
+fi
+cat <<EOF
 
 NOTE: Docker published ports BYPASS UFW. When exposing services, bind them to
 127.0.0.1 or this node's Tailscale IP, or put them behind Cloudflare Tunnel.
