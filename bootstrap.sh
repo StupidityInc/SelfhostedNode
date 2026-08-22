@@ -27,13 +27,15 @@ LOG_FILE="/tmp/homelab-bootstrap-$(date +%Y%m%d-%H%M%S).log"
 NODE_ENV_DIR="/etc/homelab"
 NODE_ENV_FILE="$NODE_ENV_DIR/node.env"
 SCRIPT_VERSION="5"
-CLOUDFLARED_APT_LIST="/etc/apt/sources.list.d/cloudflared.list"
-CLOUDFLARED_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
-# Beszel agent was moved to addons/beszel-agent/install.sh in WP5. The
-# Beszel stack directory + compose template constants now live in that
-# addon — bootstrap.sh no longer touches /opt/stacks/beszel-agent.
+# Post-laptop-1 batch: cloudflared moved to addons/cloudflared/install.sh
+# (Docker container, not host binary). bootstrap.sh no longer writes
+# /etc/apt/sources.list.d/cloudflared.list or /usr/local/bin/cloudflared.
+# The old host-binary constants are intentionally gone — operators with
+# an existing install keep it; new installs go through the addon.
 ADDONS_DIR="$SCRIPT_DIR/addons"
-BESZEL_ADDON="$ADDONS_DIR/beszel-agent/install.sh"
+BESZEL_AGENT_ADDON="$ADDONS_DIR/beszel-agent/install.sh"
+BESZEL_HUB_ADDON="$ADDONS_DIR/beszel-hub/install.sh"
+CLOUDFLARED_ADDON="$ADDONS_DIR/cloudflared/install.sh"
 RESTIC_HOST_NATIVE_ADDON="$ADDONS_DIR/restic-host-native/install.sh"
 
 if [[ ! -r "$SCRIPT_DIR/lib.sh" ]]; then
@@ -95,18 +97,41 @@ host_native_timer_detected() {
 #   3. interactive prompt → REQUESTED_THIS_RUN = (y/n)
 #   4. safe default       → false / empty
 collect_optional_intent() {
-  # 1) cloudflared (server only).
+  # 1) cloudflared (server only). Skip when the addon has already
+  #    installed the container (compose file exists) — re-runs must
+  #    not nag. The post-batch install is a Docker container, not a
+  #    host binary, so we check the compose file + container, not
+  #    `command -v cloudflared` (which is the pre-batch path).
   if [[ "$ROLE" == "server" \
     && "$CLOUDFLARED_REQUESTED_THIS_RUN" != "true" \
     && "$INSTALL_CLOUDFLARED" != "true" \
-    && ! cloudflared_is_usable \
     && wants_optional_prompts ]]; then
-    if homelab_confirm "Install cloudflared (Cloudflare Tunnel client)?" n; then
+    if $SUDO docker ps -a --filter name=^cloudflared$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^cloudflared$' \
+      || $SUDO test -f "/opt/stacks/cloudflared/docker-compose.yml"; then
+      :   # already deployed; silent skip
+    elif homelab_confirm "Install cloudflared (Cloudflare Tunnel container)?" n; then
       CLOUDFLARED_REQUESTED_THIS_RUN="true"
     fi
   fi
 
-  # 2) Beszel agent. Skip when already running or the compose file exists.
+  # 2) Beszel hub. Server-only by default (hubs rarely run on clients;
+  #    clients usually connect to a hub elsewhere). Skip when already
+  #    running or the compose file exists. Mirrors the agent prompt.
+  if [[ "$ROLE" == "server" \
+    && "$BESZEL_HUB_REQUESTED_THIS_RUN" != "true" \
+    && "$INSTALL_BESZEL_HUB" != "true" \
+    && wants_optional_prompts ]]; then
+    if $SUDO docker ps -a --filter name=^beszel-hub$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^beszel-hub$' \
+      || $SUDO test -f "/opt/stacks/beszel-hub/docker-compose.yml"; then
+      :   # already deployed; silent skip
+    elif homelab_confirm "Install Beszel hub (monitoring server UI) on this node?" n; then
+      BESZEL_HUB_REQUESTED_THIS_RUN="true"
+    fi
+  fi
+
+  # 3) Beszel agent. Skip when already running or the compose file exists.
   if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" != "true" \
     && "$INSTALL_BESZEL_AGENT" != "true" \
     && wants_optional_prompts ]]; then
@@ -126,7 +151,7 @@ collect_optional_intent() {
   # as the only way to opt in, and let --migrate-from-host-native (with its
   # own gate) carry the reverse direction.
 
-  # 3) Advertise exit node (server only). Skip when already advertised
+  # 4) Advertise exit node (server only). Skip when already advertised
   #    via persisted state — re-running must not toggle this implicitly.
   if [[ "$ROLE" == "server" \
     && "$ADVERTISE_EXIT_NODE" != "true" \
@@ -136,7 +161,7 @@ collect_optional_intent() {
     fi
   fi
 
-  # 4) Use exit node. Skip on persisted state so a re-run does not flip
+  # 5) Use exit node. Skip on persisted state so a re-run does not flip
   #    routing silently. The prompt is shown primarily for clients, but
   #    we do not role-gate it (a server may legitimately want one).
   if [[ -z "$USE_EXIT_NODE" && wants_optional_prompts ]]; then
@@ -148,7 +173,7 @@ collect_optional_intent() {
     fi
   fi
 
-  # 5) Migrate host-native → lobaro. Only when the timer is detected AND
+  # 6) Migrate host-native → lobaro. Only when the timer is detected AND
   #    lobaro is not already running. Already-migrated nodes: silent skip.
   if [[ "$MIGRATE_FROM_HOST_NATIVE_THIS_RUN" != "true" \
     && wants_optional_prompts ]]; then
@@ -199,101 +224,12 @@ need_root_or_sudo() {
   REAL_USER="${SUDO_USER:-$USER}"
 }
 
-cloudflared_cleanup_apt() {
-  # These paths are managed by this bootstrap, and must not survive a failed
-  # repository setup to break a later global apt update.
-  if ! $SUDO rm -f "$CLOUDFLARED_APT_LIST" "$CLOUDFLARED_KEYRING"; then
-    warn "Could not remove Cloudflare apt metadata; future apt updates may still need manual cleanup"
-  fi
-  return 0
-}
-
-cloudflared_source_suite() {
-  [[ -r "$CLOUDFLARED_APT_LIST" ]] || return 1
-  awk '$1 == "deb" { print $4; exit }' "$CLOUDFLARED_APT_LIST" 2>/dev/null
-}
-
-cloudflared_release_available() {
-  local suite="$1"
-  [[ -n "$suite" ]] || return 1
-  curl -fsSL --max-time 10 \
-    "https://pkg.cloudflare.com/cloudflared/dists/$suite/Release" \
-    >/dev/null 2>&1
-}
-
-cloudflared_is_usable() {
-  command -v cloudflared >/dev/null 2>&1 \
-    && cloudflared --version >/dev/null 2>&1
-}
-
-cloudflared_cleanup_stale_apt() {
-  local suite=""
-  if [[ -r "$CLOUDFLARED_APT_LIST" ]]; then
-    suite="$(cloudflared_source_suite || true)"
-    if ! cloudflared_release_available "$suite"; then
-      warn "Removing stale or unsupported Cloudflare apt source (suite=${suite:-unknown})"
-      cloudflared_cleanup_apt
-    fi
-  elif [[ -e "$CLOUDFLARED_APT_LIST" || -e "$CLOUDFLARED_KEYRING" ]]; then
-    warn "Removing unreadable or orphaned Cloudflare apt metadata"
-    cloudflared_cleanup_apt
-  fi
-}
-
-install_cloudflared_binary() {
-  local arch asset url tmp
-  arch="$(dpkg --print-architecture 2>/dev/null || true)"
-  case "$arch" in
-    amd64) asset="cloudflared-linux-amd64" ;;
-    i386)  asset="cloudflared-linux-386" ;;
-    arm64) asset="cloudflared-linux-arm64" ;;
-    armhf|armel) asset="cloudflared-linux-arm" ;;
-    *)
-      warn "No official cloudflared binary mapping for architecture '$arch'; skipping"
-      return 1
-      ;;
-  esac
-
-  url="https://github.com/cloudflare/cloudflared/releases/latest/download/$asset"
-  if ! tmp="$(mktemp)"; then
-    warn "Could not create a temporary file for the cloudflared binary"
-    return 1
-  fi
-  if ! curl -fsSL --retry 2 "$url" -o "$tmp"; then
-    rm -f "$tmp"
-    return 1
-  fi
-  if ! $SUDO install -m 0755 "$tmp" /usr/local/bin/cloudflared; then
-    rm -f "$tmp"
-    return 1
-  fi
-  rm -f "$tmp"
-  cloudflared_is_usable
-}
-
-install_cloudflared_apt() {
-  if ! curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-    | $SUDO tee "$CLOUDFLARED_KEYRING" >/dev/null; then
-    cloudflared_cleanup_apt
-    return 1
-  fi
-  # Cloudflare documents the "any" suite for all Debian-based distributions.
-  if ! printf '%s\n' \
-    "deb [signed-by=$CLOUDFLARED_KEYRING] https://pkg.cloudflare.com/cloudflared any main" \
-    | $SUDO tee "$CLOUDFLARED_APT_LIST" >/dev/null; then
-    cloudflared_cleanup_apt
-    return 1
-  fi
-  if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
-    cloudflared_cleanup_apt
-    return 1
-  fi
-  if ! $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared; then
-    cloudflared_cleanup_apt
-    return 1
-  fi
-  cloudflared_is_usable
-}
+# Post-laptop-1 batch: cloudflared moved to addons/cloudflared/install.sh
+# (Docker container). The old apt-list / binary helpers
+# (cloudflared_cleanup_apt, install_cloudflared_apt, install_cloudflared_binary,
+# cloudflared_is_usable, etc.) are gone from bootstrap.sh — see the
+# cloudflared addon for the new path. bootstrap.sh now only references
+# $CLOUDFLARED_ADDON.
 
 # Beszel agent (WP5): all helper functions and configure_beszel_agent()
 # moved to addons/beszel-agent/install.sh. bootstrap.sh no longer touches
@@ -324,6 +260,8 @@ INSTALL_CLOUDFLARED="false"  # successfully applied state
 CLOUDFLARED_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 INSTALL_BESZEL_AGENT="false"  # successfully applied state
 BESZEL_AGENT_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
+INSTALL_BESZEL_HUB="false"    # successfully applied state
+BESZEL_HUB_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 INSTALL_RESTIC_HOST_NATIVE="false"  # successfully applied state (read-only here)
 RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 MIGRATE_FROM_HOST_NATIVE_THIS_RUN="false"  # explicit request; never persisted (WP7)
@@ -346,6 +284,7 @@ PERSISTED_EXIT_NODE_APPLIED=""
 PERSISTED_ADVERTISE_EXIT_NODE=""
 PERSISTED_INSTALL_CLOUDFLARED=""
 PERSISTED_INSTALL_BESZEL_AGENT=""
+PERSISTED_INSTALL_BESZEL_HUB=""
 PERSISTED_INSTALL_RESTIC_HOST_NATIVE=""
 PERSISTED_EXIT_NODE_LAN_ACCESS=""
 PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP=""
@@ -364,6 +303,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   ADVERTISE_EXIT_NODE=""
   INSTALL_CLOUDFLARED=""
   INSTALL_BESZEL_AGENT=""
+  INSTALL_BESZEL_HUB=""
   INSTALL_RESTIC_HOST_NATIVE=""
   EXIT_NODE_LAN_ACCESS=""
   DIRECT_PUBLIC_IP_AT_SETUP=""
@@ -379,6 +319,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   PERSISTED_ADVERTISE_EXIT_NODE="$ADVERTISE_EXIT_NODE"
   PERSISTED_INSTALL_CLOUDFLARED="$INSTALL_CLOUDFLARED"
   PERSISTED_INSTALL_BESZEL_AGENT="$INSTALL_BESZEL_AGENT"
+  PERSISTED_INSTALL_BESZEL_HUB="$INSTALL_BESZEL_HUB"
   PERSISTED_INSTALL_RESTIC_HOST_NATIVE="$INSTALL_RESTIC_HOST_NATIVE"
   PERSISTED_EXIT_NODE_LAN_ACCESS="$EXIT_NODE_LAN_ACCESS"
   PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP="$DIRECT_PUBLIC_IP_AT_SETUP"
@@ -393,9 +334,14 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   USE_EXIT_NODE="$PERSISTED_USE_EXIT_NODE"
   ADVERTISE_EXIT_NODE="${PERSISTED_ADVERTISE_EXIT_NODE:-false}"
   INSTALL_CLOUDFLARED="${PERSISTED_INSTALL_CLOUDFLARED:-false}"
+  # Post-batch stale-state guard: addon owns /opt/stacks/cloudflared/.
+  # A persisted INSTALL_CLOUDFLARED=true with neither container nor
+  # compose file means the previous install was wiped — clear the flag.
   if [[ "$INSTALL_CLOUDFLARED" == "true" ]] \
-    && ! cloudflared_is_usable; then
-    warn "Persisted cloudflared state was true, but the command is missing; clearing stale install intent"
+    && ! $SUDO docker ps -a --filter name=^cloudflared$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^cloudflared$' \
+    && ! $SUDO test -f "/opt/stacks/cloudflared/docker-compose.yml"; then
+    warn "Persisted cloudflared state was true, but no cloudflared container or Compose file exists; clearing stale install intent"
     INSTALL_CLOUDFLARED="false"
   fi
   INSTALL_BESZEL_AGENT="${PERSISTED_INSTALL_BESZEL_AGENT:-false}"
@@ -408,6 +354,15 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
     && ! $SUDO test -f "/opt/stacks/beszel-agent/docker-compose.yml"; then
     warn "Persisted Beszel agent state was true, but no beszel-agent container or Compose file exists; clearing stale install intent"
     INSTALL_BESZEL_AGENT="false"
+  fi
+  INSTALL_BESZEL_HUB="${PERSISTED_INSTALL_BESZEL_HUB:-false}"
+  # Symmetric guard for the Beszel hub. Addon owns /opt/stacks/beszel-hub/.
+  if [[ "$INSTALL_BESZEL_HUB" == "true" ]] \
+    && ! $SUDO docker ps -a --filter name=^beszel-hub$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^beszel-hub$' \
+    && ! $SUDO test -f "/opt/stacks/beszel-hub/docker-compose.yml"; then
+    warn "Persisted Beszel hub state was true, but no beszel-hub container or Compose file exists; clearing stale install intent"
+    INSTALL_BESZEL_HUB="false"
   fi
   INSTALL_RESTIC_HOST_NATIVE="${PERSISTED_INSTALL_RESTIC_HOST_NATIVE:-false}"
   # Symmetric guard for the host-native addon. If a previous run persisted
@@ -451,10 +406,22 @@ Options:
   --use-exit-node=NAME       (client) Route internet via this exit node.
                              Applied LAST, after UFW/restic/connectivity are
                              verified, with probe + automatic rollback.
-  --install-cloudflared      (server) Install and prepare Cloudflare Tunnel
+  --install-cloudflared      (server) Install Cloudflare Tunnel via the
+                              addons/cloudflared/install.sh addon (Docker
+                              container at /opt/stacks/cloudflared/, token
+                              from CLOUDFLARE_TUNNEL_TOKEN env var)
   --beszel-agent             Opt in to a Beszel agent connected to a manual
                               hub (addons/beszel-agent/install.sh, dispatched
                               after exit-node apply)
+  --beszel-hub               (server) Opt in to the Beszel hub server UI
+                              (addons/beszel-hub/install.sh). Tailscale-only
+                              bind by default; never 0.0.0.0 unless
+                              BESZEL_HUB_BIND=0.0.0.0 is explicit.
+  --beszel-both              Convenience: --beszel-hub + --beszel-agent. The
+                              agent auto-derives BESZEL_HUB_URL from the local
+                              hub's Tailscale IP and forces
+                              BESZEL_ALLOW_SAME_HOST_HUB_URL=true. Cannot be
+                              combined with --beszel-agent or --beszel-hub.
   --install-restic-host-native
                               Opt in to the host-native restic systemd path
                               (addons/restic-host-native/install.sh). Mutually
@@ -513,6 +480,15 @@ for arg in "$@"; do
     --use-exit-node=*)     USE_EXIT_NODE="${arg#*=}" ;;
     --install-cloudflared) CLOUDFLARED_REQUESTED_THIS_RUN="true" ;;
     --beszel-agent)        BESZEL_AGENT_REQUESTED_THIS_RUN="true" ;;
+    --beszel-hub)          BESZEL_HUB_REQUESTED_THIS_RUN="true" ;;
+    --beszel-both)
+      if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" \
+        || "$BESZEL_HUB_REQUESTED_THIS_RUN" == "true" ]]; then
+        error "--beszel-both cannot be combined with --beszel-agent or --beszel-hub (they are already set this run)"
+      fi
+      BESZEL_AGENT_REQUESTED_THIS_RUN="true"
+      BESZEL_HUB_REQUESTED_THIS_RUN="true"
+      ;;
     --install-restic-host-native) RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="true" ;;
     --migrate-from-host-native)  MIGRATE_FROM_HOST_NATIVE_THIS_RUN="true" ;;
     --no-public-ssh)       KEEP_PUBLIC_SSH="false" ;;
@@ -590,9 +566,17 @@ if ! confirm "Proceed with bootstrap?"; then
   exit 0
 fi
 
-# A failed older run may have left an unsupported suite behind. Remove it
-# before the first global apt update, even when this run has no cloudflared flag.
-cloudflared_cleanup_stale_apt
+# Post-batch: a failed older run may have left a Cloudflare apt source
+# behind. Remove it before the first global apt update — bootstrap no
+# longer writes /etc/apt/sources.list.d/cloudflared.list, so anything
+# there is from a pre-batch run. The cleanup is local and idempotent.
+if $SUDO test -e /etc/apt/sources.list.d/cloudflared.list \
+  || $SUDO test -e /usr/share/keyrings/cloudflare-main.gpg; then
+  info "Removing legacy Cloudflare apt metadata (cloudflared now ships as a Docker container addon)"
+  $SUDO rm -f /etc/apt/sources.list.d/cloudflared.list \
+    /usr/share/keyrings/cloudflare-main.gpg || \
+    warn "Could not remove legacy Cloudflare apt metadata; apt-update may still need manual cleanup"
+fi
 
 # ---------- 1. Base packages ----------
 info "Installing base packages..."
@@ -942,6 +926,7 @@ write_node_env() {
     homelab_format_kv ADVERTISE_EXIT_NODE "$ADVERTISE_EXIT_NODE"
     homelab_format_kv INSTALL_CLOUDFLARED "$INSTALL_CLOUDFLARED"
     homelab_format_kv INSTALL_BESZEL_AGENT "$INSTALL_BESZEL_AGENT"
+    homelab_format_kv INSTALL_BESZEL_HUB "$INSTALL_BESZEL_HUB"
     homelab_format_kv INSTALL_RESTIC_HOST_NATIVE "$INSTALL_RESTIC_HOST_NATIVE"
     homelab_format_kv EXIT_NODE_LAN_ACCESS "$EXIT_NODE_LAN_ACCESS"
     homelab_format_kv DIRECT_PUBLIC_IP_AT_SETUP "$DIRECT_PUBLIC_IP_AT_SETUP"
@@ -957,30 +942,14 @@ write_node_env
 info "Persisted identity and firewall state to $NODE_ENV_FILE"
 
 # ---------- 5. Role-specific extras ----------
-if [[ "$ROLE" == "server" && "$CLOUDFLARED_REQUESTED_THIS_RUN" == "true" ]]; then
-  info "Installing cloudflared..."
-  if cloudflared_is_usable; then
-    INSTALL_CLOUDFLARED="true"
-  elif install_cloudflared_apt; then
-    INSTALL_CLOUDFLARED="true"
-  else
-    warn "Cloudflare apt installation failed; trying the official cloudflared binary"
-    cloudflared_cleanup_apt
-    if install_cloudflared_binary; then
-      INSTALL_CLOUDFLARED="true"
-    else
-      INSTALL_CLOUDFLARED="false"
-      cloudflared_cleanup_apt
-      warn "cloudflared could not be installed; continuing without it. Re-run with --install-cloudflared after fixing the package or network path."
-    fi
-  fi
-  # Persist only the applied result, never a failed current-run request.
-  write_node_env
-  if [[ "$INSTALL_CLOUDFLARED" == "true" ]]; then
-    info "cloudflared installed. You still need to run 'cloudflared tunnel login' and create a tunnel manually."
-    info "See: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/"
-  fi
-fi
+# Post-batch: cloudflared is no longer installed inline. The actual
+# install happens in step 9 (addon dispatch) when the core bootstrap
+# has converged. The legacy `cloudflared_is_usable` /
+# `install_cloudflared_apt` / `install_cloudflared_binary` helpers
+# are gone — see addons/cloudflared/install.sh. CLOUDFLARED_REQUESTED_THIS_RUN
+# is preserved across the rest of the run and picked up by step 9.
+:
+
 
 # ---------- 6. Restic setup ----------
 # Skipped on --migrate-from-host-native: step 6b's migrate-to-lobaro.sh owns
@@ -1159,17 +1128,50 @@ dispatch_addon() {
   if ! bash "$addon_path"; then
     error "Addon '$addon_label' failed. Core bootstrap succeeded; the failed addon did not roll back core state. Re-run with the same opt-in flag after fixing the issue."
   fi
-  INSTALL_BESZEL_AGENT="${PERSISTED_INSTALL_BESZEL_AGENT:-false}"
   # Reload the persisted state so the final-notes block sees the freshly-
   # written INSTALL_* flag(s) without needing a second read pass.
-  if [[ -f "$NODE_ENV_FILE" ]] && [[ "$LIB_LOADED" != "true" ]]; then
-    # lib.sh is already sourced at the top; nothing to do.
-    :
+  if [[ -f "$NODE_ENV_FILE" ]]; then
+    INSTALL_BESZEL_AGENT=""
+    INSTALL_BESZEL_HUB=""
+    INSTALL_CLOUDFLARED=""
+    INSTALL_RESTIC_HOST_NATIVE=""
+    if homelab_load_kv_sudo "$SUDO" "$NODE_ENV_FILE" "${HOMELAB_NODE_ENV_KEYS[@]}"; then
+      :
+    fi
   fi
 }
 
+# Beszel dispatch order: hub FIRST (if requested), then agent. The agent
+# may auto-derive BESZEL_HUB_URL from the local hub when --beszel-both
+# was used, but only after the hub is up. install.sh for the agent then
+# sees the local hub via container introspection (with
+# BESZEL_ALLOW_SAME_HOST_HUB_URL forced to true by this script).
+if [[ "$BESZEL_HUB_REQUESTED_THIS_RUN" == "true" ]]; then
+  dispatch_addon "$BESZEL_HUB_ADDON" "beszel-hub"
+fi
 if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
-  dispatch_addon "$BESZEL_ADDON" "beszel-agent"
+  # If hub is local on this node (BESZEL_HUB_REQUESTED_THIS_RUN ran
+  # above), force the same-host override AND auto-derive BESZEL_HUB_URL
+  # from the Tailscale IP SSOT (written by step 3a). The URL falls back
+  # to the operator-supplied BESZEL_HUB_URL when set; --beszel-both
+  # only auto-derives when the operator did not pass BESZEL_HUB_URL=...
+  # explicitly.
+  if [[ "$BESZEL_HUB_REQUESTED_THIS_RUN" == "true" ]]; then
+    export BESZEL_ALLOW_SAME_HOST_HUB_URL="${BESZEL_ALLOW_SAME_HOST_HUB_URL:-true}"
+    if [[ -z "${BESZEL_HUB_URL:-}" && -r /opt/homelab/env-file/tailscale.env ]]; then
+      TS_IP_VAL="$(awk -F= '$1=="TAILSCALE_IP" {sub(/^[^=]*=/,""); print; exit}' /opt/homelab/env-file/tailscale.env 2>/dev/null || true)"
+      if [[ -n "$TS_IP_VAL" ]]; then
+        HUB_PORT_VAL="$(grep -E '^BESZEL_HUB_PORT=' /opt/stacks/beszel-hub/.env 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "'\"")"
+        HUB_PORT_VAL="${HUB_PORT_VAL:-8090}"
+        export BESZEL_HUB_URL="http://${TS_IP_VAL}:${HUB_PORT_VAL}"
+        info "Auto-derived BESZEL_HUB_URL from Tailscale IP (--beszel-both): $BESZEL_HUB_URL"
+      fi
+    fi
+  fi
+  dispatch_addon "$BESZEL_AGENT_ADDON" "beszel-agent"
+fi
+if [[ "${CLOUDFLARED_REQUESTED_THIS_RUN:-false}" == "true" ]]; then
+  dispatch_addon "$CLOUDFLARED_ADDON" "cloudflared"
 fi
 if [[ "${RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN:-false}" == "true" ]]; then
   dispatch_addon "$RESTIC_HOST_NATIVE_ADDON" "restic-host-native"
@@ -1206,6 +1208,18 @@ Next steps:
        sudo $0 --no-public-ssh   # after confirming Tailscale SSH works
 
 EOF
+if [[ "$INSTALL_BESZEL_HUB" == "true" ]]; then
+  HUB_BIND="$(grep -E '^BESZEL_HUB_BIND=' /opt/stacks/beszel-hub/.env 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "'\"")"
+  HUB_PORT="$(grep -E '^BESZEL_HUB_PORT=' /opt/stacks/beszel-hub/.env 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "'\"")"
+  HUB_PORT="${HUB_PORT:-8090}"
+  cat <<EOF
+Beszel hub:
+   UI:  http://${HUB_BIND}:${HUB_PORT}  (also reachable at http://<this-node-tailscale-name>:${HUB_PORT} from inside the tailnet)
+   Create your admin account in the UI, then "Add System" to get a public key
+   and token for each agent (sudo ./addons/beszel-agent/install.sh).
+
+EOF
+fi
 if [[ "$INSTALL_BESZEL_AGENT" == "true" ]]; then
   cat <<EOF
 Beszel agent:

@@ -217,17 +217,28 @@ should be able to `cat AGENT.md` and resume work without other context.
 
 **Not done yet (next sessions).**
 
-- None. WP1–WP7 are complete. Future work, if any, lives outside this
-  transformation brief (see CHANGES.md WP7 entry's "Not yet started"
-  note: "WP8+ (none defined; this is the last work package in the
-  transformation brief)").
+- None for the transformation brief. The post-laptop-1
+  improvement batch (set -u hardening, restic validation, Beszel
+  hub/agent/both, cloudflared-as-addon, perms policy) is complete
+  — see CHANGES.md → "2026-08-22 (laptop-2 / improvement batch)".
+  Live E2E is still deferred per §5 rule 5.
 
 **Other.**
 
-- `addons/{beszel-agent,restic-host-native,lib-addon.sh,README.md}`
-  are no longer stubs — they implement WP5's contract. `cloudflared`
-  remains core (WP5 deliberately deferred the move per the WP5 brief).
+- `addons/{beszel-agent,beszel-hub,restic-host-native,cloudflared,
+  lib-addon.sh,README.md}` implement the WP5 + laptop-2 contracts.
+  Cloudflared moved from inline core to its own addon in the
+  laptop-2 batch; the host binary path at
+  `/usr/local/bin/cloudflared` and the apt metadata at
+  `/etc/apt/sources.list.d/cloudflared.list` are no longer written
+  by bootstrap (legacy artifacts are cleaned up idempotently on
+  re-run).
 - `beszel-agent/docker-compose.yml` template is unchanged.
+- Post-laptop-1 permission policy (F3): stack dirs 755 root:root,
+  compose 644, `.env` 600. `addon_root_only_dir` default changed
+  from 700 to 755. `addon_persist_flag` still passes 700 for
+  `/etc/homelab/`. The full matrix is in
+  `addons/README.md` "Permissions policy".
 - A previous planning artifact (`PLAN.md`, 1178 lines) remains deleted.
   If you see references to it in old commits or notes, ignore them.
 
@@ -1367,10 +1378,14 @@ complete.
 | Node identity | `/etc/homelab/node.env` | written by `bootstrap.sh` |
 | Host tooling | `/opt/stacks/_backup/` | `lib.sh`, `check-node.sh`, `change-restic-password.sh` at repo root |
 | Node system scripts | `/opt/stacks/_system/` | `_system/` at repo root (copied by bootstrap step 3a) |
-| Beszel stack | `/opt/stacks/beszel-agent/` | `beszel-agent/docker-compose.yml` at repo root, written by `addons/beszel-agent/install.sh` |
-| Beszel addon installer | (called from repo path during bootstrap, or directly via `sudo ./addons/beszel-agent/install.sh`) | `addons/beszel-agent/install.sh` |
+| Beszel agent stack | `/opt/stacks/beszel-agent/` | `beszel-agent/docker-compose.yml` at repo root, written by `addons/beszel-agent/install.sh` |
+| Beszel agent addon installer | (called from repo path during bootstrap, or directly via `sudo ./addons/beszel-agent/install.sh`) | `addons/beszel-agent/install.sh` |
+| Beszel hub stack | `/opt/stacks/beszel-hub/` (Tailscale-bind by default; port 8090) | `addons/beszel-hub/docker-compose.yml.tmpl` substituted by `addons/beszel-hub/install.sh` |
+| Beszel hub addon installer | (called from bootstrap `--beszel-hub` / `--beszel-both`, or directly via `sudo ./addons/beszel-hub/install.sh`) | `addons/beszel-hub/install.sh` |
+| Cloudflared tunnel stack | `/opt/stacks/cloudflared/` (Docker container, `network_mode: host`) | `addons/cloudflared/docker-compose.yml.tmpl` substituted by `addons/cloudflared/install.sh` |
+| Cloudflared addon installer | (called from bootstrap `--install-cloudflared`, or directly via `sudo ./addons/cloudflared/install.sh`) | `addons/cloudflared/install.sh` |
 | Host-native restic addon | `/etc/systemd/system/restic-backup.{service,timer}` + `/opt/stacks/_backup/backup.sh` | `addons/restic-host-native/install.sh` copies `restic-backup.service`, `restic-backup.timer`, `backup.sh` from repo root |
-| Addon shared helpers | sourced by every addon installer | `addons/lib-addon.sh` |
+| Addon shared helpers | sourced by every addon installer | `addons/lib-addon.sh` (laptop-2: `addon_root_only_dir` default mode 755) |
 | Host-native → lobaro migration helper | (no runtime install) | `migrate-to-lobaro.sh` at repo root (WP7); also dispatched by `bootstrap.sh --migrate-from-host-native` as step 6b |
 
 ### Key repo files
@@ -1385,12 +1400,14 @@ complete.
 | `setup-restic.lobaro.yml.tmpl` | Compose template for the lobaro stack. WP2 created this; `setup-restic.sh` substitutes placeholders before writing `docker-compose.yml`. |
 | `lib.sh` | Safe state/secret parsing helpers. WP5 adds `INSTALL_RESTIC_HOST_NATIVE` to `HOMELAB_NODE_ENV_KEYS` and extends `homelab_backup_path` with a `$2` flag override. |
 | `backup.sh` | Host-native backup script. **WP5: addon-only.** Reaches `/opt/stacks/_backup/backup.sh` via `addons/restic-host-native/install.sh`. |
-| `check-node.sh` | Health / exit-node / backup-freshness checker. WP3 expands this. WP5 passes `INSTALL_RESTIC_HOST_NATIVE` to `homelab_backup_path`. |
+| `check-node.sh` | Health / exit-node / backup-freshness checker. WP3 expands this. WP5 passes `INSTALL_RESTIC_HOST_NATIVE` to `homelab_backup_path`. Laptop-2 adds Beszel hub/agent + cloudflared container health checks when their `INSTALL_*=true` flag is set in `/etc/homelab/node.env`. |
 | `change-restic-password.sh` | Safe password rotation. Unchanged through WP1–WP6. |
 | `restic-backup.service` / `.timer` | Scheduling + sandbox. **WP5: addon-only.** Reaches `/etc/systemd/system/` via `addons/restic-host-native/install.sh`. |
 | `_system/` | Source for node-side `/opt/stacks/_system/` scripts. |
-| `addons/` | Addon installers. WP5 fills the stubs; addons are the supported way to install Beszel and the host-native restic path. |
-| `beszel-agent/` | Beszel Compose template + `.env.example`. WP5 reads this from `addons/beszel-agent/install.sh`. |
+| `addons/` | Addon installers. WP5 fills the stubs; the laptop-2 batch added `beszel-hub/` and `cloudflared/` and tightened `lib-addon.sh` defaults (stack dirs 755, `.env` 600). |
+| `beszel-agent/` | Beszel **agent** Compose template + `.env.example`. Consumed by `addons/beszel-agent/install.sh`. |
+| `addons/beszel-hub/` | Beszel **hub** addon (NEW, laptop-2). Tailscale-bind by default; never 0.0.0.0 unless the operator passes `BESZEL_HUB_BIND=0.0.0.0` (WARN). |
+| `addons/cloudflared/` | Cloudflared tunnel addon (NEW, laptop-2). Docker container, `network_mode: host`. Replaces the pre-batch host-binary path. |
 | `migrate-to-lobaro.sh` | One-shot host-native → lobaro migration helper (WP7). Idempotent. Invoked directly or via `bootstrap.sh --migrate-from-host-native` (step 6b). |
 | `MIGRATION.md` | Operator recipe for WP7: prerequisites, command variants, idempotency rules, post-migration verification, rollback for success/failure paths. |
 

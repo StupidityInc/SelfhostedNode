@@ -1,5 +1,117 @@
 # Changes
 
+## 2026-08-22 (laptop-2 / improvement batch)
+
+Post-laptop-1 hardening + new addons. Order: A (set -u) → B (restic
+validation) → C (Beszel hub/agent/both) → D (cloudflared addon) → E
+(layout cleanup) → F (perms policy).
+
+`addons/beszel-agent/install.sh`:
+
+- A1: `beszel_same_host_override` no longer crashes on
+  `set -u` when `BESZEL_ALLOW_SAME_HOST_HUB_URL` is unset
+  (the common case for a remote hub). One-line fix: `${VAR:-}`.
+- C3: refuses to install when a local `beszel-hub` container is
+  already running UNLESS `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` is
+  set. Catches the case where the operator wants both roles on
+  one node but forgot the override.
+- F3: stack dir mode changed 700 → 755 (compose 644, .env 600).
+
+`addons/lib-addon.sh` + `addons/README.md`:
+
+- F3: `addon_root_only_dir` default mode 700 → 755. Stack dirs are
+  now 755 root:root, compose files 644, secret-bearing `.env`
+  files 600. `addon_persist_flag` still passes 700 explicitly for
+  `/etc/homelab/`. New "Permissions policy" section in
+  `addons/README.md` documents the matrix.
+
+`setup-restic.sh`:
+
+- B1: password type-back mismatch is now louder ("passwords DO NOT
+  MATCH"), with a copy-paste hint. Happy path prints
+  "Password accepted." (one line, before continuing).
+- B2: new "Proving host restic can open the repository..." step.
+  Runs `restic cat config` via a stderr-capturing helper after the
+  env file is written; runs on EVERY path (REUSE_EXISTING or
+  fresh), so a re-run that lost a credential surfaces a clear
+  error before "complete".
+- B3: S3 / R2 classifier maps restic errors to one of {AUTH,
+  ENDPOINT, BUCKET, WRONG PASSWORD, REPO, UNKNOWN} and prints a
+  single actionable hint. Replaces the old generic
+  "init failed (network? credentials? endpoint?)" message. Unknown
+  cases still surface the restic stderr under the classifier line.
+- B4: explicit "Repo-id pin matches live repository." echo on
+  the happy path of `homelab_assert_repo_id_pinned`.
+- B5: tightened final tail — "Repository: ... (reachable)",
+  "Password: /etc/restic/password (mode 600, root-owned)",
+  "Repo-id pinned: <64-hex>", schedules, and the unchanged
+  host-native note.
+- F3: stack dir mode 700 → 755 (matches the addon policy).
+
+`addons/beszel-hub/` (NEW):
+
+- C2: full hub installer + Compose template + README. Bind address
+  defaults to Tailscale IP from `/opt/homelab/env-file/tailscale.env`,
+  fallback 127.0.0.1. NEVER 0.0.0.0 unless the operator passes
+  `BESZEL_HUB_BIND=0.0.0.0` (WARN printed). Default port 8090
+  (`BESZEL_HUB_PORT` override). Follows the addon contract
+  (validate → atomic write → start → verify → persist
+  `INSTALL_BESZEL_HUB=true`).
+
+`addons/cloudflared/` (NEW):
+
+- D1: full cloudflared installer (Docker container, NOT host
+  binary). Reads `CLOUDFLARE_TUNNEL_TOKEN` from env or from an
+  existing `.env`; prompts with `read -s` interactively; refuses
+  in non-interactive mode if the token is missing. Compose
+  template pins `network_mode: host` (required by the QUIC
+  tunnel protocol) and bind-mounts a `config/` directory for
+  cert persistence.
+
+`bootstrap.sh`:
+
+- C1: new flags `--beszel-hub` and `--beszel-both`.
+  `--beszel-both` is rejected if either single flag was already
+  passed this run. `collect_optional_intent` adds a hub prompt
+  (server-only, parallel to the agent prompt). `write_node_env`
+  persists `INSTALL_BESZEL_HUB`; load phase has a symmetric
+  staleness guard. Final-notes block prints the hub URL on
+  success.
+- C1 (both-mode auto-derive): when both flags are set and the
+  operator did not pass `BESZEL_HUB_URL=...` explicitly,
+  bootstrap derives the URL from the Tailscale IP SSOT
+  (`/opt/homelab/env-file/tailscale.env`) and the hub's
+  `BESZEL_HUB_PORT` from `/opt/stacks/beszel-hub/.env`. It also
+  forces `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` for the agent
+  dispatch so the same-host validation passes.
+- C5: `INSTALL_BESZEL_HUB` plumbed through `usage()`,
+  `write_node_env`, dispatch reload, and final-notes.
+- D2: removed all `cloudflared_*` helpers
+  (`cloudflared_cleanup_apt`, `install_cloudflared_apt`,
+  `install_cloudflared_binary`, `cloudflared_is_usable`, etc.)
+  and the inline `Step 5` install block. Replaced with a
+  dispatch into `addons/cloudflared/install.sh` at step 9 (same
+  pattern as the other addons). The `cloudflared_cleanup_apt`
+  pre-apt step was replaced with a one-shot `rm -f` of the
+  legacy apt list + keyring (idempotent, no host-binary install).
+- Final notes updated to print Beszel hub URL on success.
+
+`lib.sh`:
+
+- C5: `INSTALL_BESZEL_HUB` added to `HOMELAB_NODE_ENV_KEYS` so
+  `check-node.sh` and addons can load it through the safe loader.
+
+`check-node.sh`:
+
+- New "Beszel (addon)" section: surfaces a missing
+  `beszel-hub` / `beszel-agent` container as FAIL when the
+  persisted `INSTALL_BESZEL_*=true` flag says it should be
+  running. Same pattern for `cloudflared`. Parallel to the
+  existing restic-container check.
+
+`AGENT.md` / `README.md` updated to reflect the new addon
+contracts and perms policy. No locked decision was changed.
+
 ## 2026-08-22 (laptop-1 bootstrap fixes)
 
 Bugs found on the first real-server bootstrap run, no scope creep.

@@ -48,6 +48,8 @@ ADVERTISE_EXIT_NODE=""
 DIRECT_PUBLIC_IP_AT_SETUP=""
 KEEP_PUBLIC_SSH=""
 INSTALL_BESZEL_AGENT=""
+INSTALL_BESZEL_HUB=""
+INSTALL_CLOUDFLARED=""
 INSTALL_RESTIC_HOST_NATIVE=""
 NODE_ENV_READABLE="false"
 if [[ "$LIB_LOADED" == "true" ]] && $SUDO test -r /etc/homelab/node.env 2>/dev/null; then
@@ -414,6 +416,54 @@ if $SUDO test -r /etc/restic/env 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.sh" ]]; t
   fi
 else
   fail "Cannot safely read /etc/restic/env or the installed lib.sh – skipping snapshot freshness check"
+fi
+echo
+
+# ---------- Beszel (addon-installed) ----------
+# Post-laptop-1: hub + agent are both addons. Surface a missing container
+# when the persisted flag is true (parity with the restic addon check).
+echo "── Beszel (addon) ──"
+if [[ "$INSTALL_BESZEL_HUB" == "true" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    HUB_RUNNING="$($SUDO docker inspect -f '{{.State.Running}}' beszel-hub 2>/dev/null || echo "false")"
+    if [[ "$HUB_RUNNING" == "true" ]]; then
+      ok "beszel-hub container is running"
+    else
+      fail "beszel-hub container is not running (node.env says installed; start with: sudo docker compose --env-file /opt/stacks/beszel-hub/.env -f /opt/stacks/beszel-hub/docker-compose.yml up -d)"
+    fi
+  else
+    fail "node.env says INSTALL_BESZEL_HUB=true but Docker is missing"
+  fi
+fi
+if [[ "$INSTALL_BESZEL_AGENT" == "true" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    AGENT_RUNNING="$($SUDO docker inspect -f '{{.State.Running}}' beszel-agent 2>/dev/null || echo "false")"
+    if [[ "$AGENT_RUNNING" == "true" ]]; then
+      ok "beszel-agent container is running"
+    else
+      fail "beszel-agent container is not running (node.env says installed; start with: sudo docker compose --env-file /opt/stacks/beszel-agent/.env -f /opt/stacks/beszel-agent/docker-compose.yml up -d)"
+    fi
+  else
+    fail "node.env says INSTALL_BESZEL_AGENT=true but Docker is missing"
+  fi
+fi
+echo
+
+# ---------- Cloudflared (addon) ----------
+# Post-laptop-1: cloudflared is a Docker container addon. The legacy
+# host binary is no longer the supported install path.
+echo "── Cloudflared (addon) ──"
+if [[ "${INSTALL_CLOUDFLARED:-}" == "true" ]]; then
+  if command -v docker >/dev/null 2>&1; then
+    CF_RUNNING="$($SUDO docker inspect -f '{{.State.Running}}' cloudflared 2>/dev/null || echo "false")"
+    if [[ "$CF_RUNNING" == "true" ]]; then
+      ok "cloudflared container is running"
+    else
+      fail "cloudflared container is not running (node.env says installed; start with: sudo docker compose --env-file /opt/stacks/cloudflared/.env -f /opt/stacks/cloudflared/docker-compose.yml up -d)"
+    fi
+  else
+    fail "node.env says INSTALL_CLOUDFLARED=true but Docker is missing"
+  fi
 fi
 echo
 

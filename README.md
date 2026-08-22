@@ -149,15 +149,19 @@ truth for backups:
 
 ### Addons
 
-Two pieces that used to live inline in `bootstrap.sh` are now addons:
+Four pieces that used to live inline in `bootstrap.sh` (or in
+`beszel-agent/` templates) are now addons:
 
 | Addon | Repo path | Runtime path (when installed) |
 |-------|-----------|-------------------------------|
+| Beszel hub | `addons/beszel-hub/install.sh` | `/opt/stacks/beszel-hub/` (Tailscale-bind by default) |
 | Beszel agent | `addons/beszel-agent/install.sh` | `/opt/stacks/beszel-agent/` |
 | Host-native restic | `addons/restic-host-native/install.sh` | `/opt/stacks/_backup/backup.sh` + `/etc/systemd/system/restic-backup.{service,timer}` |
+| Cloudflared | `addons/cloudflared/install.sh` | `/opt/stacks/cloudflared/` (Docker container) |
 
 `bootstrap.sh` only invokes an addon when an explicit opt-in flag was
-set THIS run (`--beszel-agent` or `--install-restic-host-native`). A
+set THIS run (`--beszel-agent`, `--beszel-hub`, `--beszel-both`,
+`--install-cloudflared`, or `--install-restic-host-native`). A
 plain re-run with no flags is a no-op for addons. Step 9 of
 `bootstrap.sh` ("Addon dispatch") is the only place addons are
 invoked, and it runs **after** core safety has converged (Tailscale up,
@@ -168,6 +172,13 @@ Addons are mutually exclusive with the lobaro path **on install**:
 `docker inspect -f '{{.State.Running}}' restic-backup` is `true`. The
 inverse direction is enforced by `setup-restic.sh` as a WARN (not a
 refuse) so re-runs and migration windows are not blocked.
+
+**Permissions (post-laptop-1 batch):** every stack dir is 755
+root:root, the `docker-compose.yml` is 644, and the `.env` is 600.
+Identity dirs (`/etc/homelab/`) and secrets dirs (`/etc/restic/`)
+stay 700. The `addon_root_only_dir` helper defaults to 755; callers
+that need 700 for a secret-only dir must pass the mode explicitly.
+Full matrix in `addons/README.md` "Permissions policy".
 
 ### Tailscale IP single source of truth
 
@@ -270,23 +281,48 @@ only for an explicit, intentional reopen. Refusing `--role` and
 
 ## Optional addons
 
-### Beszel agent (addon)
+### Beszel — hub / agent / both (addons)
 
-Beszel is opt-in. The addon at `addons/beszel-agent/install.sh`
-installs only the agent under `/opt/stacks/beszel-agent/`; it never
-installs the hub or Uptime Kuma. The full validation + Compose
-+ `.env` + container-verification logic now lives in the addon (was
-inline in `bootstrap.sh` before WP5); bootstrap only passes the
-`--beszel-agent` opt-in.
+Beszel is opt-in. There are two addons:
 
-Set up the hub manually once on the monitoring node, commonly under
-`/opt/stacks/beszel/`. Keep its UI reachable through Tailscale only.
-In the hub UI, use **Add System** (or create a universal token) and
-copy the agent's public `KEY` and `TOKEN`.
+- `addons/beszel-hub/install.sh` — the **hub** (server UI + data
+  store). Deployed to `/opt/stacks/beszel-hub/`. Binds to the
+  Tailscale IP by default (read from
+  `/opt/homelab/env-file/tailscale.env`); NEVER 0.0.0.0 unless
+  `BESZEL_HUB_BIND=0.0.0.0` is explicit (the addon prints a WARN).
+  Default port 8090 (`BESZEL_HUB_PORT` override). The first-run
+  operator creates the admin account in the UI.
+- `addons/beszel-agent/install.sh` — the **agent** on a remote
+  node. Connects outbound to a hub URL. No inbound ports; no UFW
+  changes.
 
-For non-interactive use, pass `--beszel-agent` and the required values.
-The hub URL must be a Tailscale IP or a hostname that resolves to a
-Tailscale address:
+The two addons are independent: you can install just the agent
+(typical for fleet nodes that report to a hub elsewhere) or just
+the hub (the monitoring node itself). For a single-node "test
+everything on this box" install, use `--beszel-both` — it runs the
+hub first, then the agent, with `BESZEL_HUB_URL` auto-derived from
+the local Tailscale IP and `BESZEL_ALLOW_SAME_HOST_HUB_URL=true`
+forced so the agent's same-host validation passes.
+
+Bootstrap flags:
+
+```bash
+# Agent only (most common)
+sudo ./bootstrap.sh --role=client --node-name=compute-1 \
+  --beszel-agent --yes
+
+# Hub only (monitoring node)
+sudo ./bootstrap.sh --role=server --node-name=monitor-1 \
+  --beszel-hub --yes
+
+# Both on a single node
+sudo ./bootstrap.sh --role=server --node-name=edge-1 \
+  --beszel-both --yes
+```
+
+For non-interactive use, pass the agent credentials via env vars.
+The hub URL must be a Tailscale IP or a hostname that resolves to
+a Tailscale address:
 
 ```bash
 sudo env \
@@ -299,9 +335,11 @@ sudo env \
 `BESZEL_SYSTEM_NAME` is optional and defaults to `NODE_NAME`. Loopback
 or public hub URLs are rejected unless
 `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` is explicitly set for a hub
-running on this same host.
+running on this same host (the agent installer also auto-refuses
+when a local `beszel-hub` container is running, to prevent
+silent loopback connections).
 
-The addon collects the credentials (interactively or via env vars)
+The agent collects its credentials (interactively or via env vars)
 during step 9, after core safety has converged. The generated
 `/opt/stacks/beszel-agent/.env` is root-owned with mode `600`. It is
 intentionally inside `/opt/stacks`, so it is included in the encrypted
@@ -310,17 +348,55 @@ restic backup; never commit it or place real credentials in
 for interface statistics, listens only on `127.0.0.1:45876`, disables
 the inbound SSH mode, and publishes no Docker ports or UFW rules.
 
+The hub's `.env` holds only the bind address, port, and an optional
+`BESZEL_PUBLIC_URL` hint. The hub does not need an external token
+(admin password is created in the UI; agent KEY/TOKEN pairs come
+from the hub's **Add System** flow).
+
 Verify after bootstrap:
 
 ```bash
+sudo docker ps --filter name=beszel-hub
 sudo docker ps --filter name=beszel-agent
-sudo docker compose --env-file /opt/stacks/beszel-agent/.env \
-  -f /opt/stacks/beszel-agent/docker-compose.yml ps
+sudo /opt/stacks/_backup/check-node.sh
 ```
 
-The agent should then appear healthy in the manually managed hub UI.
-Install Uptime Kuma manually on the monitoring node only; it is not
-automated here.
+The agent should then appear healthy in the hub UI. Install Uptime
+Kuma manually on the monitoring node only; it is not automated here.
+
+### Cloudflared (addon)
+
+Cloudflare's `cloudflared` is now a Docker container addon
+(`addons/cloudflared/install.sh`). The previous host-binary path
+(`/usr/local/bin/cloudflared`, apt source at
+`/etc/apt/sources.list.d/cloudflared.list`) is no longer the
+supported install — bootstrap cleans up any legacy apt metadata on
+re-run, and new installs go through the addon.
+
+To install:
+
+```bash
+sudo CLOUDFLARE_TUNNEL_TOKEN="<token-from-cloudflare-dashboard>" \
+  ./bootstrap.sh --role=server --node-name=edge-1 \
+  --install-cloudflared --yes
+# or standalone:
+sudo CLOUDFLARE_TUNNEL_TOKEN="<token>" \
+  ./addons/cloudflared/install.sh
+```
+
+The token comes from the Cloudflare dashboard (Zero Trust →
+Networks → Tunnels → Create a tunnel → copy the token). The addon
+writes it to `/opt/stacks/cloudflared/.env` (mode 600). The
+container runs in `network_mode: host` (required by the QUIC
+tunnel protocol) and bind-mounts a `config/` directory for cert
+persistence. Bootstrap's `default allow outgoing` policy covers
+the outbound path to Cloudflare's edge; no UFW rule is required
+for inbound.
+
+Token rotation: rotate in the Cloudflare dashboard, then
+`sudo sed -i 's|^CLOUDFLARE_TUNNEL_TOKEN=.*|...|' /opt/stacks/cloudflared/.env`
+and `docker compose up -d` in the stack dir (or just re-run the
+addon).
 
 ### Host-native restic (addon)
 
@@ -371,8 +447,10 @@ The repo source layout:
 | `change-restic-password.sh` | Safe restic password rotation. Used by both the lobaro and the host-native paths. |
 | `_system/` | Source for node-side `/opt/stacks/_system/` (Tailscale IP SSOT writer, units, `tailscaled` drop-in). |
 | `beszel-agent/` | Compose template + `.env.example` for the Beszel **agent**. Consumed by `addons/beszel-agent/install.sh`. |
-| `addons/lib-addon.sh` | Shared helpers for `addons/*/install.sh`. `addon_log`, `addon_require_root`, `addon_use_sudo`, `addon_assert_not_running`, `addon_assert_running`, `addon_root_only_dir`, `addon_root_only_file`, `addon_persist_flag` (atomic upsert into `/etc/homelab/node.env`). |
-| `addons/beszel-agent/install.sh` | Beszel agent installer (addon). |
+| `addons/lib-addon.sh` | Shared helpers for `addons/*/install.sh`. `addon_log`, `addon_require_root`, `addon_use_sudo`, `addon_assert_not_running`, `addon_assert_running`, `addon_root_only_dir` (default mode **755**, post-laptop-1), `addon_root_only_file`, `addon_persist_flag` (atomic upsert into `/etc/homelab/node.env`). Permissions policy documented in `addons/README.md`. |
+| `addons/beszel-agent/install.sh` | Beszel **agent** installer (addon). Refuses when a local `beszel-hub` container is running unless `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` is set. |
+| `addons/beszel-hub/install.sh` | Beszel **hub** installer (addon). Tailscale-IP bind by default; never 0.0.0.0 unless the operator passes `BESZEL_HUB_BIND=0.0.0.0` (with a WARN). Default port 8090. |
+| `addons/cloudflared/install.sh` | Cloudflared tunnel installer (addon). Docker container, `network_mode: host`. Token via `CLOUDFLARE_TUNNEL_TOKEN` env var or `read -s` prompt. Replaces the pre-batch host-binary path. |
 | `addons/restic-host-native/install.sh` | Host-native restic installer (addon). Refuses while the lobaro container is running. |
 | `RESTORE.md` | Self-describing recovery instructions (lobaro-primary, repo-id-aware, Tailscale IP regeneration). |
 | `CHANGES.md` | What was hardened and why, dated by work package. |
@@ -405,7 +483,9 @@ Node-local state that does not live in this repo:
 | `/etc/restic/recovery-key.present` | Marker only — never the secret itself. |
 | `/var/cache/restic` | Restic cache (writable by the lobaro container and the host-native systemd unit). |
 | `/opt/stacks/restic-backup/` | The lobaro Compose project (PRIMARY backup). Not auto-created if `setup-restic.sh` was never run. |
-| `/opt/stacks/beszel-agent/` | Beszel agent stack — only present when `addons/beszel-agent/install.sh` was run. |
+| `/opt/stacks/beszel-agent/` | Beszel agent stack — only present when `addons/beszel-agent/install.sh` was run. Mode 755 dir, compose 644, `.env` 600. |
+| `/opt/stacks/beszel-hub/` | Beszel hub stack — only present when `addons/beszel-hub/install.sh` was run. Mode 755 dir, compose 644, `.env` 600, `beszel_data/` 755. |
+| `/opt/stacks/cloudflared/` | Cloudflared tunnel stack — only present when `addons/cloudflared/install.sh` was run. Mode 755 dir, compose 644, `.env` 600 (tunnel token), `config/` 755. |
 
 ## Observability
 

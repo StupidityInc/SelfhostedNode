@@ -1,0 +1,17 @@
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    # network_mode: host is REQUIRED for the cloudflared tunnel protocol
+    # (QUIC over UDP 7844 + fallback HTTPS). It bypasses UFW for
+    # inbound (no rule needed) and is allowed for outbound by bootstrap
+    # step 4's default `allow outgoing` policy. If you need to restrict
+    # inbound, drop this and use a `network:` bridge with explicit
+    # port mappings.
+    network_mode: host
+    command: tunnel --no-autoupdate run
+    env_file:
+      - .env
+    volumes:
+      - ./config:/etc/cloudflared

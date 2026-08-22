@@ -41,7 +41,7 @@ addon_use_sudo
 
 # ---------- Helpers copied from bootstrap.sh (kept self-contained per WP5) ----------
 beszel_same_host_override() {
-  case "${BESZEL_ALLOW_SAME_HOST_HUB_URL,,}" in
+  case "${BESZEL_ALLOW_SAME_HOST_HUB_URL:-}" in
     1|true|yes) return 0 ;;
     *) return 1 ;;
   esac
@@ -199,12 +199,25 @@ addon_collect_beszel_config
 if ! beszel_validate_hub_url_reachability; then
   addon_error "BESZEL_HUB_URL does not resolve to a Tailscale address from this node: $BESZEL_HUB_URL. Use a MagicDNS name or 100.x Tailscale address, or set BESZEL_ALLOW_SAME_HOST_HUB_URL=true for a same-host hub"
 fi
+# A1 / C3: if a local beszel-hub is running on THIS node, the agent
+# will try to talk to it via Tailscale only. Refuse unless the operator
+# explicitly opted into the same-host override -- otherwise the hub URL
+# may be a non-Tailscale address (e.g. http://127.0.0.1:8090) and the
+# validation above will silently pass while the agent loopback points at
+# itself for nothing.
+if ! beszel_same_host_override; then
+  if docker inspect -f '{{.State.Running}}' beszel-hub 2>/dev/null | grep -q '^true$'; then
+    addon_error "A local beszel-hub container is running on this node. Re-run with BESZEL_ALLOW_SAME_HOST_HUB_URL=true to point the agent at it, or stop the hub and use a remote hub URL."
+  fi
+fi
 if ! docker compose version >/dev/null 2>&1; then
   addon_error "Docker Compose is required to deploy the Beszel agent"
 fi
 
 # ---------- 2. Atomic write ----------
-addon_root_only_dir "$BESZEL_AGENT_STACK_DIR" 700
+# F3: stack dir 755 root:root (compose 644, .env 600). The beszel_agent_data
+# subdir keeps 755; secrets stay in .env at 600.
+addon_root_only_dir "$BESZEL_AGENT_STACK_DIR" 755
 
 # Copy the compose template into the stack dir. install(1) sets mode + owner
 # in one syscall; the file is idempotent — same content on re-runs.

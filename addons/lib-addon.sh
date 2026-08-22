@@ -8,13 +8,16 @@
 #   addon_assert_not_running CONTAINER
 #   addon_assert_running CONTAINER
 #   addon_assert_not_enabled_unit UNIT
-#   addon_root_only_dir PATH MODE
-#   addon_root_only_file PATH MODE  (atomic write + chmod + mv)
+#   addon_root_only_dir PATH MODE   (default MODE = 755, post-laptop-1)
+#   addon_root_only_file PATH MODE  (atomic write + chmod + mv; default 600)
 #   addon_persist_flag NAME VALUE  (atomic upsert into /etc/homelab/node.env)
 #
 # Sourced by every addons/<name>/install.sh. Sibling addons must not modify
 # the on-disk contract: every flag MUST be persisted ONLY AFTER the runtime
 # artifact is verified running (see addons/README.md).
+#
+# Permissions default: stack dirs are 755 root:root; compose 644; .env 600.
+# See addons/README.md "Permissions policy" for the full matrix.
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   echo "lib-addon.sh is meant to be sourced, not executed." >&2
@@ -86,11 +89,16 @@ addon_assert_not_enabled_unit() {
   fi
 }
 
-# Create a directory owned by root with the given mode (default 700).
+# Create a directory owned by root with the given mode (default 755).
+# The default changed from 700 to 755 in the post-laptop-1 batch: stack
+# directories (compose + .env + data) are now 755 root:root, with the
+# compose file at 644 and secret-bearing .env at 600 (see addons/README.md
+# "Permissions policy"). Callers that need a tighter mode for a
+# secret-only directory MUST pass it explicitly.
 # Does NOT recurse-chown an existing tree — that's an addon's responsibility
 # if it wants different ownership.
 addon_root_only_dir() {
-  local path="$1" mode="${2:-700}"
+  local path="$1" mode="${2:-755}"
   if [[ -d "$path" ]]; then
     chmod "$mode" "$path"
     return 0
@@ -104,7 +112,8 @@ addon_root_only_file() {
   local path="$1" mode="${2:-600}"
   local dir tmp
   dir="$(dirname "$path")"
-  [[ -d "$dir" ]] || addon_root_only_dir "$dir" 700
+  # F3: parent dir default is 755 (stack dir). The .env itself is 600.
+  [[ -d "$dir" ]] || addon_root_only_dir "$dir" 755
   tmp="$(mktemp "$dir/.$(basename "$path").XXXXXX")"
   if ! cat > "$tmp"; then
     rm -f "$tmp"
@@ -134,6 +143,9 @@ addon_persist_flag() {
   fi
   local dir tmp new_line
   dir="$(dirname "$env_file")"
+  # F3: /etc/homelab/ holds node.env (identity, INSTALL_* flags) and is
+  # therefore 700 — not a stack dir. The default 755 only applies to
+  # /opt/stacks/* paths.
   addon_root_only_dir "$dir" 700
   tmp="$(mktemp "$dir/.$(basename "$env_file").XXXXXX")"
   chmod 600 "$tmp"

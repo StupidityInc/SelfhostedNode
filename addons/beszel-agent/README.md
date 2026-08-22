@@ -21,7 +21,9 @@ moved into the addon so it stays self-contained).
 ## Pre-flight (required before running)
 
 1. Hub must already be running on another node, reachable via
-   Tailscale (100.64.0.0/10 or fd7a:115c:a1e0::/48).
+   Tailscale (100.64.0.0/10 or fd7a:115c:a1e0::/48). For a same-host
+   hub, set `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` (the addon refuses
+   without it when a `beszel-hub` container is detected locally).
 2. Hub UI must have created a system entry; copy the public
    `KEY` and `TOKEN` from there.
 3. `BESZEL_HUB_URL`, `BESZEL_AGENT_KEY`, `BESZEL_AGENT_TOKEN` must be
@@ -29,8 +31,13 @@ moved into the addon so it stays self-contained).
 
 ## Mutual exclusion
 
-None currently. If you want both `restic-host-native` and Beszel,
-that's fine — they don't conflict.
+- If a local `beszel-hub` container is running on this node, the agent
+  refuses UNLESS `BESZEL_ALLOW_SAME_HOST_HUB_URL=true` is set. This
+  catches the case where the operator runs `--beszel-both` (which
+  auto-derives the URL) but also wants the agent on a node that already
+  has the hub. The both-flag path auto-sets the override.
+- No conflict with `restic-host-native` (different ports, different
+  services).
 
 ## Re-run safety
 

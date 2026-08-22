@@ -38,6 +38,23 @@ Re-running an addon MUST be safe. Either:
 Addons MUST NEVER silently rotate secrets, change passwords, or
 recreate data volumes on a re-run.
 
+## Permissions policy (F3)
+
+Per the post-laptop-1 batch, stack directories follow a single,
+predictable permission scheme:
+
+| Path                                  | Mode  | Owner      |
+|---------------------------------------|-------|------------|
+| Stack dir (e.g. `/opt/stacks/<name>`)  | 755   | root:root  |
+| `docker-compose.yml`                  | 644   | root:root  |
+| `.env` (secret-bearing)               | 600   | root:root  |
+| Data subdir (`beszel_data`, `config`) | 755   | root:root  |
+
+Identity dirs (`/etc/homelab/`, `/etc/restic/`) stay 700 — they are
+NOT stack dirs. `addon_root_only_dir` defaults to 755; callers that
+need 700 for a secret-only dir MUST pass the mode explicitly
+(see `addons/lib-addon.sh:addon_persist_flag`).
+
 ## Shared helpers
 
 Source `addons/lib-addon.sh` from your `install.sh`. It provides:
@@ -70,9 +87,11 @@ exclusion in the addon's `README.md`.
 
 | Addon | Status |
 |-------|--------|
-| `beszel-agent` | stub — implementation in WP5 |
-| `restic-host-native` | stub — implementation in WP5 |
-| `cloudflared` | candidate — may move here in WP5; can stay core for this iteration |
+| `beszel-agent` | implemented (post-WP5) |
+| `beszel-hub` | implemented (post-laptop-1 batch) |
+| `restic-host-native` | implemented (post-WP5) |
+| `cloudflared` | implemented (post-laptop-1 batch) — Docker container, not host binary |
 
-See `AGENT.md` §3 WP5 for the move from inline `bootstrap.sh` code to
-these addon installers.
+See `AGENT.md` §3 WP5 for the original move from inline `bootstrap.sh`
+code to these addon installers. The post-laptop-1 batch added the
+hub/cloudflared addons and tightened the addon contract.

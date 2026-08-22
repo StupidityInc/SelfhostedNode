@@ -57,6 +57,34 @@ run_restic() {
   $SUDO bash -c 'source "$1"; homelab_load_restic_env /etc/restic/env; exec restic "${@:2}"' _ "$SCRIPT_DIR/lib.sh" "$@"
 }
 
+# B3: run_restic with stderr captured to a file. The init/open checks
+# below classify failures by reading the captured blob. Caller must
+# $SUDO-rm the tmpfile. Returns the restic exit code.
+run_restic_capture() {
+  local err_tmp="$1"
+  shift
+  $SUDO bash -c 'source "$1"; homelab_load_restic_env /etc/restic/env; exec restic "${@:2}" 2>"$3"' _ "$SCRIPT_DIR/lib.sh" "$err_tmp" "$@"
+}
+
+# B3: classify a restic error blob into a single actionable hint.
+# Echoes a one-line cause. Used by both the "init" and "open" checks.
+classify_restic_failure() {
+  local err="$1"
+  if grep -qiE 'invalid (credentials|access key|aws|signature)|s3: .*signature|authentication' <<<"$err"; then
+    echo "AUTH failed: check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (signature/authentication error from S3)"
+  elif grep -qiE 'no such host|connection refused|i/o timeout|network is unreachable|no route to host|getaddrinfo' <<<"$err"; then
+    echo "ENDPOINT unreachable: cannot reach the S3 host (need exit node? wrong S3_ENDPOINT?)"
+  elif grep -qiE 'no such bucket|nosuchbucket|404' <<<"$err"; then
+    echo "BUCKET missing: the named bucket does not exist on the endpoint"
+  elif grep -qiE 'wrong password|decrypt|invalid password' <<<"$err"; then
+    echo "WRONG PASSWORD: the repository refused the supplied RESTIC_PASSWORD"
+  elif grep -qiE 'repository does not exist|is not a repository' <<<"$err"; then
+    echo "REPO missing: the bucket/prefix exists but is not a restic repository"
+  else
+    echo "UNKNOWN: see restic error output below"
+  fi
+}
+
 # ---------- Node name: explicit, validated, never silently defaulted ----------
 REQUESTED_NODE_NAME="$(printf '%s' "${NODE_NAME:-}" | tr '[:upper:]' '[:lower:]')"
 PERSISTED_NODE_NAME=""
@@ -223,10 +251,12 @@ else
         read -r -s -p "Type/paste the password back to prove you saved it: " CONFIRM
         echo
         if [[ "$CONFIRM" != "$PASSWORD" ]]; then
-          echo "ERROR: mismatch. Aborting BEFORE writing anything or touching the repository." >&2
-          echo "Nothing was changed. Re-run this script to try again." >&2
+          echo "ERROR: passwords DO NOT MATCH. Aborting BEFORE writing anything or touching the repository." >&2
+          echo "       Hint: copy-paste from your password manager to avoid typos." >&2
+          echo "       Nothing was changed. Re-run this script to try again." >&2
           exit 1
         fi
+        echo "Password accepted."
       else
         echo "WARNING: non-interactive mode – the password above is your only offline copy."
         echo "         Store it securely. (Or provide RESTIC_PASSWORD via environment instead.)"
@@ -297,18 +327,61 @@ $SUDO mv "$ENV_DOCKER_TMP" /etc/restic/env.docker
 echo "Wrote /etc/restic/env.docker (raw KEY=VALUE for Compose env_file)"
 
 # ---------- Initialize repository ----------
+# B2/B3: capture stderr to classify the failure instead of a single
+# generic "init failed" line. The classifier maps restic's error to
+# one of {AUTH, ENDPOINT, BUCKET, WRONG PASSWORD, REPO, UNKNOWN} and
+# prints an actionable hint per cause.
 echo
 echo "Checking repository (initializing if needed)..."
-if run_restic cat config >/dev/null 2>&1; then
+INIT_ERR_TMP="$($SUDO mktemp /tmp/homelab-restic-init.XXXXXX)"
+trap 'rm -f "$INIT_ERR_TMP"' EXIT
+if run_restic cat config >/dev/null 2>"$INIT_ERR_TMP"; then
   echo "Repository already initialized."
 else
-  if ! run_restic init; then
-    echo "ERROR: repository init failed (network path? credentials? endpoint?)." >&2
-    echo "If S3 is only reachable via a Tailscale exit node, enable that first and re-run." >&2
+  if run_restic_capture "$INIT_ERR_TMP" init; then
+    echo "Repository initialized successfully."
+  else
+    CAUSE="$(classify_restic_failure "$($SUDO cat "$INIT_ERR_TMP" 2>/dev/null || true)")"
+    echo "ERROR: repository init failed." >&2
+    echo "       Cause: $CAUSE" >&2
+    echo "       If S3 is only reachable via a Tailscale exit node, enable that first and re-run." >&2
+    if [[ "$CAUSE" == UNKNOWN* ]]; then
+      echo "       restic error output:" >&2
+      $SUDO cat "$INIT_ERR_TMP" | sed 's/^/         /' >&2 || true
+    fi
     exit 1
   fi
-  echo "Repository initialized successfully."
 fi
+
+# B2: open-repo proof. Runs `restic cat config` again through the
+# classifier. This is the "password accepted + repository reachable"
+# proof the brief asks for: it covers the S3 auth path, the bucket
+# reachability, the prefix, the password, and the repo state in one
+# shot. Runs on EVERY path (REUSE_EXISTING and fresh) so a re-run that
+# lost a credential surfaces a clear error before the operator is told
+# "complete".
+echo "Proving host restic can open the repository..."
+OPEN_ERR_TMP="$($SUDO mktemp /tmp/homelab-restic-open.XXXXXX)"
+trap 'rm -f "$INIT_ERR_TMP" "$OPEN_ERR_TMP"' EXIT
+if run_restic_capture "$OPEN_ERR_TMP" cat config >/dev/null; then
+  echo "Host restic opened the repository OK."
+else
+  OPEN_ERR="$($SUDO cat "$OPEN_ERR_TMP" 2>/dev/null || true)"
+  CAUSE="$(classify_restic_failure "$OPEN_ERR")"
+  echo "ERROR: host restic cannot open the repository with the current /etc/restic/env." >&2
+  echo "       Cause: $CAUSE" >&2
+  echo "       Common remediation (in order of likelihood):" >&2
+  echo "         1. Wrong RESTIC_PASSWORD (re-run and re-type, or supply RESTIC_PASSWORD=...)" >&2
+  echo "         2. Wrong AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY" >&2
+  echo "         3. Unreachable S3 endpoint (need exit node? wrong S3_ENDPOINT?)" >&2
+  echo "         4. Wrong BUCKET / PREFIX (does the bucket exist and accept this prefix?)" >&2
+  if [[ "$CAUSE" == UNKNOWN* ]]; then
+    echo "       restic error output:" >&2
+    printf '%s\n' "$OPEN_ERR" | sed 's/^/         /' >&2
+  fi
+  exit 1
+fi
+rm -f "$OPEN_ERR_TMP"
 
 # ---------- Pin repo-id ----------
 # Reads the live UUID via `restic cat config --json` and writes it to
@@ -388,8 +461,10 @@ if [[ ! -r "$TEMPLATE_FILE" ]]; then
 fi
 
 # Atomic write: tmpfile in stack dir, sed-substitute, chmod, mv.
+# F3: stack dir is 755 root:root (compose 644, .env 600). 700 was over-
+# tight; docker-compose v2 has no group requirement.
 $SUDO mkdir -p "$STACK_DIR"
-$SUDO chmod 700 "$STACK_DIR"
+$SUDO chmod 755 "$STACK_DIR"
 
 # Substitution: escape `|` (sed delimiter), `&` (sed "matched text") and
 # `\` in each value before inserting it via sed.
@@ -467,6 +542,7 @@ if ! homelab_assert_repo_id_pinned; then
   echo "ERROR: repo-id pin verification failed." >&2
   exit 1
 fi
+echo "Repo-id pin matches live repository (${HOMELAB_REPO_ID_LIVE:-unknown})."
 LATEST_TAG="$(run_restic snapshots --json --latest 1 2>/dev/null | jq -r '.[0].tags[]? // empty' 2>/dev/null | head -n1 || true)"
 if [[ "$LATEST_TAG" != "$NODE_NAME" ]]; then
   echo "NOTE: no existing snapshot with tag '$NODE_NAME' yet. The container's"
@@ -562,14 +638,17 @@ fi
 
 echo
 echo "=== Lobaro backup setup complete ==="
+echo "Repository    : $REPO  (reachable)"
+echo "Password      : /etc/restic/password  (mode 600, root-owned)"
+PINNED_ID="$(cat /etc/restic/repo-id 2>/dev/null || echo '<missing>')"
+echo "Repo-id pinned: $PINNED_ID"
+echo "Backup schedule (UTC) : $BACKUP_CRON_VAL"
+echo "Check schedule  (UTC) : $CHECK_CRON_VAL"
+echo
 echo "Next steps:"
 echo "  1. Health check:    sudo /opt/stacks/_backup/check-node.sh"
 echo "  2. List snapshots:  sudo bash -c 'source /opt/stacks/_backup/lib.sh; homelab_restic snapshots'"
 echo "  3. Container logs:  sudo docker logs restic-backup --tail 50"
-echo
-echo "Backup schedule (UTC): $BACKUP_CRON_VAL"
-echo "Check schedule (UTC):  $CHECK_CRON_VAL"
-echo "Pinned repo-id:        $(cat /etc/restic/repo-id 2>/dev/null || echo '<missing>')"
 echo
 echo "The repository password lives only in /etc/restic/password and your password manager."
 echo "To rotate it later:        sudo /opt/stacks/_backup/change-restic-password.sh"
