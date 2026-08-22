@@ -131,6 +131,7 @@ HOMELAB_NODE_ENV_KEYS=(
   ADVERTISE_EXIT_NODE
   INSTALL_CLOUDFLARED
   INSTALL_BESZEL_AGENT
+  INSTALL_RESTIC_HOST_NATIVE
   EXIT_NODE_LAN_ACCESS
   DIRECT_PUBLIC_IP_AT_SETUP
   KEEP_PUBLIC_SSH
@@ -165,6 +166,80 @@ homelab_ufw_is_active() {
   $sudo_cmd ufw status 2>/dev/null | grep -qi '^Status: active'
 }
 
+# True if $1 is a syntactically valid IPv4 address (a.b.c.d with each octet
+# 0..255). Returns 0 for valid, 1 otherwise. No CIDR suffix allowed.
+homelab_ipv4_is_valid() {
+  local ip="$1" a b c d
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 ))
+}
+
+# True if $1 is a Tailscale CGNAT IPv4 (100.64.0.0/10). Used to validate the
+# Tailscale IP SSOT file (AGENT.md §2 Tailscale IP). Returns 0 for valid,
+# 1 otherwise. No CIDR suffix allowed.
+homelab_validate_tailscale_ip() {
+  local ip="$1" a b c d
+  homelab_ipv4_is_valid "$ip" || return 1
+  IFS=. read -r a b c d <<<"$ip"
+  (( a == 100 && b >= 64 && b <= 127 ))
+}
+
+# Path to the pinned restic repository UUID. When the lobaro container is the
+# primary backup path (AGENT.md §3 WP2), this file is created during the
+# host-side `restic init` and verified on every run. See
+# homelab_repo_id / homelab_assert_repo_id_pinned.
+HOMELAB_REPO_ID_FILE="/etc/restic/repo-id"
+
+# Read the pinned repo-id from /etc/restic/repo-id (first line, raw).
+# Empties the variable when the file is missing or unreadable.
+homelab_repo_id() {
+  HOMELAB_REPO_ID=""
+  if [[ -r "$HOMELAB_REPO_ID_FILE" ]]; then
+    local line
+    line="$(head -n 1 "$HOMELAB_REPO_ID_FILE" 2>/dev/null || true)"
+    line="${line%$'\r'}"
+    # 32-char lowercase hex; conservative validation. Reject anything else.
+    if [[ "$line" =~ ^[0-9a-f]{32}$ ]]; then
+      HOMELAB_REPO_ID="$line"
+    fi
+  fi
+}
+
+# Verify the pinned repo-id matches the live restic repository. Reads
+# /etc/restic/env for credentials (use homelab_load_restic_env beforehand if
+# you need to scope the load). Returns 0 when the IDs match; 1 when the pin
+# is missing, the live repository is unreachable, or the IDs differ. Sets
+# HOMELAB_REPO_ID_LIVE so callers can decide whether to fail or repair.
+homelab_assert_repo_id_pinned() {
+  homelab_repo_id
+  if [[ -z "$HOMELAB_REPO_ID" ]]; then
+    echo "ERROR: $HOMELAB_REPO_ID_FILE is missing or does not contain a 32-char hex UUID." >&2
+    echo "       Refusing to operate without a pinned repo-id (AGENT.md §2 Backup)." >&2
+    return 1
+  fi
+  if ! command -v restic >/dev/null 2>&1; then
+    echo "ERROR: restic binary is required for repo-id verification." >&2
+    return 1
+  fi
+  # Use the host restic with /etc/restic/env credentials. Caller must have
+  # loaded the env already (typical in setup-restic.sh).
+  if ! HOMELAB_REPO_ID_LIVE="$(restic cat config --json 2>/dev/null | jq -r '.id // empty' 2>/dev/null)"; then
+    echo "ERROR: could not read live repository config with host restic." >&2
+    return 1
+  fi
+  if [[ -z "$HOMELAB_REPO_ID_LIVE" ]]; then
+    echo "ERROR: live restic repository returned no id." >&2
+    return 1
+  fi
+  if [[ "$HOMELAB_REPO_ID_LIVE" != "$HOMELAB_REPO_ID" ]]; then
+    echo "ERROR: live repo id ($HOMELAB_REPO_ID_LIVE) does not match pinned id ($HOMELAB_REPO_ID)." >&2
+    echo "       Refusing to silently accept a different repository." >&2
+    return 1
+  fi
+  return 0
+}
+
 # Marker only — the recovery password itself is never written here.
 HOMELAB_RECOVERY_KEY_MARKER="/etc/restic/recovery-key.present"
 
@@ -188,4 +263,64 @@ homelab_backup_unit_failed() {
       return 1
       ;;
   esac
+}
+
+# Detect which backup path is active on this node (AGENT.md §3 WP3 / WP5).
+# Always exits 0; prints one of:
+#   "lobaro"      — the lobaro container is the running backup path
+#   "host-native" — the host-native addon (restic-backup.timer) is enabled
+#   "both"        — both paths are active (mutually exclusive; WARN in check-node)
+#   "none"        — neither path is active (FAIL in check-node)
+#
+# Detection is heuristic, not state-mutation:
+#   - "lobaro"      iff `docker inspect restic-backup.State.Running` is "true"
+#   - "host-native" iff `systemctl is-enabled restic-backup.timer` succeeds
+#
+# WP5: callers may pass the persisted INSTALL_RESTIC_HOST_NATIVE flag as
+# $2. When the flag is "true", the host-native classification is preferred
+# over the unit-file heuristic — this catches the case where the timer was
+# disabled but the operator has explicitly opted into the addon. The flag
+# is also authoritative when set: a missing timer with flag=true classifies
+# the node as host-native so check-node.sh can surface a missing-timer FAIL
+# (operator installed the addon but it never came up). The unit heuristic
+# remains as a fallback when no flag is passed.
+#
+# $1 = sudo prefix (matches homelab_ufw_* style)
+# $2 = INSTALL_RESTIC_HOST_NATIVE override (optional: "" | "true" | "false")
+homelab_backup_path() {
+  local sudo_cmd="${1:-}"
+  local flag_override="${2:-}"
+  # shellcheck disable=SC2086
+  $sudo_cmd command -v docker >/dev/null 2>&1 || true
+  local lobaro="false"
+  if command -v docker >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    if $sudo_cmd docker inspect -f '{{.State.Running}}' restic-backup 2>/dev/null \
+      | grep -q '^true$'; then
+      lobaro="true"
+    fi
+  fi
+
+  # shellcheck disable=SC2086
+  local hostnative="false"
+  if $sudo_cmd systemctl is-enabled restic-backup.timer >/dev/null 2>&1; then
+    hostnative="true"
+  fi
+
+  # WP5 flag-precedence: when the operator (or addon installer) has
+  # persisted INSTALL_RESTIC_HOST_NATIVE=true, treat the host-native path
+  # as authoritative. The timer check above still runs, so a flag=true
+  # with a missing/disabled timer surfaces as 'host-native' — the caller
+  # (check-node.sh) then surfaces the missing timer as a separate FAIL.
+  if [[ "$flag_override" == "true" ]]; then
+    hostnative="true"
+  fi
+
+  case "$lobaro,$hostnative" in
+    true,true)   printf 'both' ;;
+    true,false)  printf 'lobaro' ;;
+    false,true)  printf 'host-native' ;;
+    *)           printf 'none' ;;
+  esac
+  return 0
 }

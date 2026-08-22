@@ -4,6 +4,32 @@
 
 This file is the source of truth for *intent*, *constraints*, *current status*, and *how to continue safely*.
 
+> **Status (2026-08-22, post-WP6).** This document is **historical intent**
+> — the goal.md-era host-native path was the default when it was
+> written. WP1–WP5 changed the running system and WP6 brought the
+> documentation in line:
+>
+> - **WP1** added a Tailscale IP single-source-of-truth file at
+>   `/opt/homelab/env-file/tailscale.env`, refreshed by a
+>   systemd timer; stacks consume it via `--env-file` / `env_file:` and
+>   never get it via a stack `.env` mutation.
+> - **WP2** rewrote `setup-restic.sh` to deploy the **lobaro
+>   `restic-backup-docker` container** as the primary backup mechanism.
+>   Host-native systemd units are no longer installed by default.
+> - **WP3** expanded `check-node.sh` to be honest for the lobaro-primary
+>   world (container running, `repo-id` pin, conditional host-native
+>   timer, mutual-exclusivity WARN).
+> - **WP4** confirmed the bootstrap ordering; the addon-dispatch step
+>   was deliberately deferred.
+> - **WP5** added the addon pattern: Beszel and host-native restic are
+>   addons, not core defaults. `INSTALL_RESTIC_HOST_NATIVE=true` was
+>   introduced.
+> - **WP6** (this doc) rewrote `README.md`, `RESTORE.md`, `RISKS.md`,
+>   and `TESTING.md` for the lobaro-primary reality.
+>
+> See `AGENT.md` §3 for the current transformation target and
+> `CHANGES.md` for dated WP-by-WP delivery records.
+
 ---
 
 ## 1. What we are trying to achieve
@@ -77,6 +103,25 @@ These are deliberate and must be preserved unless there is a very strong reason:
 - Recovery keys work interactively and through a non-interactive password-file path; rotation verifies a second key
 - Backup unit failures are visible to `check-node.sh`
 
+### Closed by WP1–WP5 (post-goal.md-era)
+- Tailscale IP has a node-local SSOT file with an atomic writer +
+  timer + `tailscaled` drop-in (WP1).
+- Primary backup is the lobaro container at
+  `/opt/stacks/restic-backup/`; the container schedules its own UTC
+  cron; `RESTIC_PASSWORD` is never placed in Compose `environment:`
+  or the stack `.env` (WP2).
+- `check-node.sh` is honest for the lobaro-primary world: it checks
+  the container, the `repo-id` pin, the snapshot freshness (host
+  `restic` is still the ground truth), the conditional host-native
+  timer, and the mutual-exclusivity WARN (WP3).
+- Bootstrap ordering and identity immutability are intact; public-SSH
+  stickiness unchanged (WP4).
+- Beszel agent and host-native restic are addons
+  (`addons/<name>/install.sh`), not inline core code. Addons follow
+  the validate → atomic write → start → verify running → only then
+  persist `INSTALL_*=true` contract. The host-native addon refuses
+  to install while the lobaro container is running (WP5).
+
 ### Previously known High issues
 These came from a second-pass review and are now addressed; residual non-High
 risks are listed in `RISKS.md`:
@@ -90,9 +135,9 @@ risks are listed in `RISKS.md`:
 7. **Recovery key path and rotation verification** — fixed
 8. **Backup unit failure visibility** — fixed
 
-These Highs are closed in the scripts, but the system is still **not** ready
-for real nodes until the supervised throwaway-machine plan is executed and the
-residual risks are understood.
+These Highs are closed in the scripts, but the system is still **not**
+ready for real nodes until the supervised throwaway-machine plan is
+executed and the residual risks are understood.
 
 ---
 
@@ -148,17 +193,24 @@ When continuing this project:
 
 | File | Role |
 |------|------|
-| `bootstrap.sh` | Main orchestrator (order is load-bearing) |
-| `setup-restic.sh` | Restic + S3 wizard / configuration |
-| `backup.sh` | Daily backup (installed verbatim, reads `node.env`) |
-| `change-restic-password.sh` | Safe password rotation |
-| `check-node.sh` | Truthful health / exit-node / exposure checker |
-| `restic-backup.service` / `.timer` | Scheduling + sandbox |
-| `RESTORE.md` | Break-glass recovery (must stay consistent with hardened bootstrap) |
-| `CHANGES.md` | What was fixed and why |
-| `TESTING.md` | Concrete throwaway-VPS test sequence |
-| `RISKS.md` | Explicit remaining accepted risks (create if missing) |
-| `goal.md` | This file — intent, constraints, continuity |
+| `bootstrap.sh` | Main orchestrator (order is load-bearing). Post-WP5: Beszel + host-native addon dispatch is step 9, after core has converged. |
+| `setup-restic.sh` | Restic + S3 wizard. Post-WP2 deploys the lobaro container; host-native systemd units are NOT installed by default. |
+| `setup-restic.lobaro.yml.tmpl` | Compose template for the lobaro stack. Placeholders substituted by `setup-restic.sh`. |
+| `_system/update-tailscale-ip.{sh,service,timer}` | Tailscale IP SSOT writer + periodic refresh. WP1. |
+| `lib.sh` | Safe state/secret parsing helpers. WP5 adds `INSTALL_RESTIC_HOST_NATIVE` and the `$2` flag override on `homelab_backup_path`. |
+| `check-node.sh` | Truthful health / exit-node / exposure checker. WP3 expanded for the lobaro-primary world; WP5 passes the `INSTALL_RESTIC_HOST_NATIVE` flag to `homelab_backup_path`. |
+| `change-restic-password.sh` | Safe password rotation. Used by both the lobaro and the host-native paths. |
+| `backup.sh`, `restic-backup.service`, `restic-backup.timer` | Host-native restic addon. WP2 stopped installing by default; WP5 moves ownership to `addons/restic-host-native/install.sh`. |
+| `addons/lib-addon.sh` | Shared helpers for `addons/*/install.sh`. `addon_persist_flag`, `addon_assert_not_running`, etc. WP5. |
+| `addons/beszel-agent/install.sh` | Beszel agent installer (addon). WP5 moved out of inline `bootstrap.sh`. |
+| `addons/restic-host-native/install.sh` | Host-native restic installer (addon). WP5. |
+| `beszel-agent/docker-compose.yml` | Compose template for the Beszel agent. Consumed by the addon installer. |
+| `RESTORE.md` | Break-glass recovery (post-WP5: lobaro-primary, `repo-id`-aware, Tailscale IP regeneration in step 5a). |
+| `CHANGES.md` | What was fixed and why, dated by WP. |
+| `TESTING.md` | Concrete throwaway-VPS test sequence. WP6 added §14–§18 for repo-id, IP SSOT, host-native addon, mutual exclusion, addon re-run. |
+| `RISKS.md` | Explicit remaining accepted risks for the post-WP5 layout. |
+| `AGENT.md` | Authoritative instructions + continuity brief for the WP1–WP6 transformation. |
+| `goal.md` | This file — intent, constraints, historical continuity. |
 
 ---
 

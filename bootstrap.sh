@@ -29,8 +29,12 @@ NODE_ENV_FILE="$NODE_ENV_DIR/node.env"
 SCRIPT_VERSION="5"
 CLOUDFLARED_APT_LIST="/etc/apt/sources.list.d/cloudflared.list"
 CLOUDFLARED_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
-BESZEL_AGENT_STACK_DIR="/opt/stacks/beszel-agent"
-BESZEL_AGENT_COMPOSE_TEMPLATE="$SCRIPT_DIR/beszel-agent/docker-compose.yml"
+# Beszel agent was moved to addons/beszel-agent/install.sh in WP5. The
+# Beszel stack directory + compose template constants now live in that
+# addon — bootstrap.sh no longer touches /opt/stacks/beszel-agent.
+ADDONS_DIR="$SCRIPT_DIR/addons"
+BESZEL_ADDON="$ADDONS_DIR/beszel-agent/install.sh"
+RESTIC_HOST_NATIVE_ADDON="$ADDONS_DIR/restic-host-native/install.sh"
 
 if [[ ! -r "$SCRIPT_DIR/lib.sh" ]]; then
   printf 'ERROR: lib.sh is required next to bootstrap.sh\n' >&2
@@ -171,215 +175,11 @@ install_cloudflared_apt() {
   cloudflared_is_usable
 }
 
-beszel_same_host_override() {
-  case "${BESZEL_ALLOW_SAME_HOST_HUB_URL,,}" in
-    1|true|yes) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-beszel_ipv4_is_valid() {
-  local ip="$1" a b c d
-  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
-  IFS=. read -r a b c d <<<"$ip"
-  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 ))
-}
-
-beszel_ipv4_is_tailnet() {
-  local ip="$1" a b c d
-  beszel_ipv4_is_valid "$ip" || return 1
-  IFS=. read -r a b c d <<<"$ip"
-  (( a == 100 && b >= 64 && b <= 127 ))
-}
-
-beszel_parse_hub_url() {
-  local url="$1" authority port
-  BESZEL_HUB_HOST=""
-  BESZEL_HUB_HOST_IS_IPV4="false"
-  BESZEL_HUB_HOST_IS_IPV6="false"
-
-  if [[ ! "$url" =~ ^https?://([^/?#]+)/*$ ]]; then
-    return 1
-  fi
-  authority="${BASH_REMATCH[1]}"
-  [[ "$authority" != *"@"* ]] || return 1
-
-  if [[ "$authority" =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]+))?$ ]]; then
-    BESZEL_HUB_HOST="${BASH_REMATCH[1]}"
-    BESZEL_HUB_HOST_IS_IPV6="true"
-    port="${BASH_REMATCH[3]:-}"
-  elif [[ "$authority" =~ ^([A-Za-z0-9][A-Za-z0-9.-]*)(:([0-9]+))?$ ]]; then
-    BESZEL_HUB_HOST="${BASH_REMATCH[1]}"
-    port="${BASH_REMATCH[3]:-}"
-    if [[ "$BESZEL_HUB_HOST" =~ ^[0-9.]+$ ]]; then
-      beszel_ipv4_is_valid "$BESZEL_HUB_HOST" || return 1
-      BESZEL_HUB_HOST_IS_IPV4="true"
-    fi
-  else
-    return 1
-  fi
-
-  if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
-    return 1
-  fi
-  [[ -n "$BESZEL_HUB_HOST" ]]
-}
-
-beszel_validate_hub_url_syntax() {
-  local host
-  beszel_parse_hub_url "$BESZEL_HUB_URL" || return 1
-  host="$BESZEL_HUB_HOST"
-
-  if beszel_same_host_override; then
-    return 0
-  fi
-  if [[ "$BESZEL_HUB_HOST_IS_IPV4" == "true" ]]; then
-    beszel_ipv4_is_tailnet "$host"
-    return
-  fi
-  if [[ "$BESZEL_HUB_HOST_IS_IPV6" == "true" ]]; then
-    [[ "$host" == fd7a:115c:a1e0:* ]]
-    return
-  fi
-  case "${host,,}" in
-    localhost|localhost.localdomain|0.0.0.0) return 1 ;;
-  esac
-  return 0
-}
-
-beszel_validate_hub_url_reachability() {
-  local resolved address
-  beszel_parse_hub_url "$BESZEL_HUB_URL" || return 1
-  if beszel_same_host_override; then
-    warn "BESZEL_HUB_URL uses the explicit same-host override; verify that the hub listens on this host"
-    return 0
-  fi
-  if [[ "$BESZEL_HUB_HOST_IS_IPV4" == "true" ]]; then
-    beszel_ipv4_is_tailnet "$BESZEL_HUB_HOST"
-    return
-  fi
-  if [[ "$BESZEL_HUB_HOST_IS_IPV6" == "true" ]]; then
-    [[ "$BESZEL_HUB_HOST" == fd7a:115c:a1e0:* ]]
-    return
-  fi
-
-  resolved="$(getent ahostsv4 "$BESZEL_HUB_HOST" 2>/dev/null | awk '{print $1}' | sort -u || true)"
-  [[ -n "$resolved" ]] || return 1
-  while IFS= read -r address; do
-    if beszel_ipv4_is_tailnet "$address"; then
-      return 0
-    fi
-  done <<<"$resolved"
-  return 1
-}
-
-beszel_collect_config() {
-  if is_interactive; then
-    if [[ -z "$BESZEL_HUB_URL" ]]; then
-      read -r -p "Beszel hub URL (Tailscale address): " BESZEL_HUB_URL
-    fi
-    if [[ -z "$BESZEL_AGENT_KEY" ]]; then
-      read -r -p "Beszel agent public key: " BESZEL_AGENT_KEY
-    fi
-    if [[ -z "$BESZEL_AGENT_TOKEN" ]]; then
-      read -r -s -p "Beszel agent token: " BESZEL_AGENT_TOKEN
-      echo
-    fi
-  fi
-
-  if [[ -z "$BESZEL_HUB_URL" || -z "$BESZEL_AGENT_KEY" || -z "$BESZEL_AGENT_TOKEN" ]]; then
-    error "Beszel agent requested but BESZEL_HUB_URL, BESZEL_AGENT_KEY, and BESZEL_AGENT_TOKEN are all required"
-  fi
-  BESZEL_SYSTEM_NAME="${BESZEL_SYSTEM_NAME:-$NODE_NAME}"
-  if [[ "$BESZEL_HUB_URL$BESZEL_AGENT_KEY$BESZEL_AGENT_TOKEN$BESZEL_SYSTEM_NAME" == *$'\n'* \
-    || "$BESZEL_HUB_URL$BESZEL_AGENT_KEY$BESZEL_AGENT_TOKEN$BESZEL_SYSTEM_NAME" == *$'\r'* ]]; then
-    error "Beszel configuration values must be single-line"
-  fi
-  if ! beszel_validate_hub_url_syntax; then
-    error "BESZEL_HUB_URL must use a Tailscale IP (100.64.0.0/10), Tailscale-resolving hostname, or the explicit same-host override"
-  fi
-}
-
-configure_beszel_agent() {
-  local compose_tmp env_tmp container_running
-
-  if [[ ! -r "$BESZEL_AGENT_COMPOSE_TEMPLATE" ]]; then
-    warn "Beszel agent Compose template is missing: $BESZEL_AGENT_COMPOSE_TEMPLATE"
-    return 1
-  fi
-  if ! beszel_validate_hub_url_reachability; then
-    warn "BESZEL_HUB_URL does not resolve to a Tailscale address from this node: $BESZEL_HUB_URL"
-    warn "Use a MagicDNS name or 100.x Tailscale address, or explicitly set BESZEL_ALLOW_SAME_HOST_HUB_URL=true for a same-host hub"
-    return 1
-  fi
-  if ! $SUDO docker compose version >/dev/null 2>&1; then
-    warn "Docker Compose is required to deploy the Beszel agent"
-    return 1
-  fi
-
-  if ! $SUDO test -d "$BESZEL_AGENT_STACK_DIR"; then
-    if ! $SUDO mkdir -p "$BESZEL_AGENT_STACK_DIR" \
-      || ! $SUDO chown root:root "$BESZEL_AGENT_STACK_DIR" \
-      || ! $SUDO chmod 700 "$BESZEL_AGENT_STACK_DIR"; then
-      warn "Could not create the root-only Beszel agent directory"
-      return 1
-    fi
-  else
-    # Tighten only the project directory itself; never change data ownership.
-    if ! $SUDO chmod 700 "$BESZEL_AGENT_STACK_DIR"; then
-      warn "Could not protect the existing Beszel agent directory"
-      return 1
-    fi
-  fi
-
-  if ! compose_tmp="$($SUDO mktemp "$BESZEL_AGENT_STACK_DIR/.docker-compose.yml.XXXXXX")"; then
-    warn "Could not create a temporary Beszel Compose file"
-    return 1
-  fi
-  if ! $SUDO cp "$BESZEL_AGENT_COMPOSE_TEMPLATE" "$compose_tmp" \
-    || ! $SUDO chown root:root "$compose_tmp" \
-    || ! $SUDO chmod 644 "$compose_tmp" \
-    || ! $SUDO mv "$compose_tmp" "$BESZEL_AGENT_STACK_DIR/docker-compose.yml"; then
-    $SUDO rm -f "$compose_tmp" || true
-    warn "Could not install the Beszel agent Compose file"
-    return 1
-  fi
-
-  if ! env_tmp="$($SUDO mktemp "$BESZEL_AGENT_STACK_DIR/.env.XXXXXX")"; then
-    warn "Could not create a temporary Beszel environment file"
-    return 1
-  fi
-  if ! {
-    homelab_format_kv BESZEL_HUB_URL "$BESZEL_HUB_URL"
-    homelab_format_kv BESZEL_AGENT_KEY "$BESZEL_AGENT_KEY"
-    homelab_format_kv BESZEL_AGENT_TOKEN "$BESZEL_AGENT_TOKEN"
-    homelab_format_kv BESZEL_SYSTEM_NAME "$BESZEL_SYSTEM_NAME"
-  } | $SUDO tee "$env_tmp" >/dev/null; then
-    $SUDO rm -f "$env_tmp" || true
-    warn "Could not write the Beszel environment file"
-    return 1
-  fi
-  if ! $SUDO chown root:root "$env_tmp" \
-    || ! $SUDO chmod 600 "$env_tmp" \
-    || ! $SUDO mv "$env_tmp" "$BESZEL_AGENT_STACK_DIR/.env"; then
-    $SUDO rm -f "$env_tmp" || true
-    warn "Could not install the protected Beszel environment file"
-    return 1
-  fi
-
-  info "Starting the Beszel agent (credentials are not logged)..."
-  if ! $SUDO docker compose --env-file "$BESZEL_AGENT_STACK_DIR/.env" \
-    -f "$BESZEL_AGENT_STACK_DIR/docker-compose.yml" up -d; then
-    warn "Beszel agent Compose startup failed; persisted install state was not changed"
-    return 1
-  fi
-  container_running="$($SUDO docker inspect -f '{{.State.Running}}' beszel-agent 2>/dev/null || true)"
-  if [[ "$container_running" != "true" ]]; then
-    warn "Beszel agent container is not running after Compose startup"
-    return 1
-  fi
-  return 0
-}
+# Beszel agent (WP5): all helper functions and configure_beszel_agent()
+# moved to addons/beszel-agent/install.sh. bootstrap.sh no longer touches
+# /opt/stacks/beszel-agent — the addon installer handles validation,
+# file writes, container startup, verification, and INSTALL_BESZEL_AGENT
+# persistence. See AGENT.md §3 WP5.
 
 GENERIC_NODE_NAMES="ubuntu debian localhost server client homelab node vps host linux default unknown"
 
@@ -404,6 +204,9 @@ INSTALL_CLOUDFLARED="false"  # successfully applied state
 CLOUDFLARED_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
 INSTALL_BESZEL_AGENT="false"  # successfully applied state
 BESZEL_AGENT_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
+INSTALL_RESTIC_HOST_NATIVE="false"  # successfully applied state (read-only here)
+RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="false"  # explicit request; never persisted
+MIGRATE_FROM_HOST_NATIVE_THIS_RUN="false"  # explicit request; never persisted (WP7)
 KEEP_PUBLIC_SSH="true"        # safety default – only tighten later
 TS_AUTHKEY="${TS_AUTHKEY:-}"  # optional non-interactive Tailscale join
 BESZEL_HUB_URL="${BESZEL_HUB_URL:-}"
@@ -423,6 +226,7 @@ PERSISTED_EXIT_NODE_APPLIED=""
 PERSISTED_ADVERTISE_EXIT_NODE=""
 PERSISTED_INSTALL_CLOUDFLARED=""
 PERSISTED_INSTALL_BESZEL_AGENT=""
+PERSISTED_INSTALL_RESTIC_HOST_NATIVE=""
 PERSISTED_EXIT_NODE_LAN_ACCESS=""
 PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP=""
 PERSISTED_KEEP_PUBLIC_SSH=""
@@ -440,6 +244,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   ADVERTISE_EXIT_NODE=""
   INSTALL_CLOUDFLARED=""
   INSTALL_BESZEL_AGENT=""
+  INSTALL_RESTIC_HOST_NATIVE=""
   EXIT_NODE_LAN_ACCESS=""
   DIRECT_PUBLIC_IP_AT_SETUP=""
   KEEP_PUBLIC_SSH=""
@@ -454,6 +259,7 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
   PERSISTED_ADVERTISE_EXIT_NODE="$ADVERTISE_EXIT_NODE"
   PERSISTED_INSTALL_CLOUDFLARED="$INSTALL_CLOUDFLARED"
   PERSISTED_INSTALL_BESZEL_AGENT="$INSTALL_BESZEL_AGENT"
+  PERSISTED_INSTALL_RESTIC_HOST_NATIVE="$INSTALL_RESTIC_HOST_NATIVE"
   PERSISTED_EXIT_NODE_LAN_ACCESS="$EXIT_NODE_LAN_ACCESS"
   PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP="$DIRECT_PUBLIC_IP_AT_SETUP"
   PERSISTED_KEEP_PUBLIC_SSH="$KEEP_PUBLIC_SSH"
@@ -473,11 +279,26 @@ if [[ -f "$NODE_ENV_FILE" ]]; then
     INSTALL_CLOUDFLARED="false"
   fi
   INSTALL_BESZEL_AGENT="${PERSISTED_INSTALL_BESZEL_AGENT:-false}"
+  # WP5: bootstrap no longer touches /opt/stacks/beszel-agent — the addon
+  # owns it. Treat a stale INSTALL_BESZEL_AGENT=true as bogus only when
+  # nothing in the runtime matches (no container, no compose file).
   if [[ "$INSTALL_BESZEL_AGENT" == "true" ]] \
-    && { ! $SUDO test -f "$BESZEL_AGENT_STACK_DIR/docker-compose.yml" \
-      || ! $SUDO test -f "$BESZEL_AGENT_STACK_DIR/.env"; }; then
-    warn "Persisted Beszel agent state was true, but its Compose or .env file is missing; clearing stale install intent"
+    && ! $SUDO docker ps -a --filter name=^beszel-agent$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^beszel-agent$' \
+    && ! $SUDO test -f "/opt/stacks/beszel-agent/docker-compose.yml"; then
+    warn "Persisted Beszel agent state was true, but no beszel-agent container or Compose file exists; clearing stale install intent"
     INSTALL_BESZEL_AGENT="false"
+  fi
+  INSTALL_RESTIC_HOST_NATIVE="${PERSISTED_INSTALL_RESTIC_HOST_NATIVE:-false}"
+  # Symmetric guard for the host-native addon. If a previous run persisted
+  # the flag but neither the timer unit nor the backup script exist on disk
+  # any more, the persisted state is bogus — clear it so re-runs do not
+  # silently re-claim a non-existent addon.
+  if [[ "$INSTALL_RESTIC_HOST_NATIVE" == "true" ]] \
+    && ! $SUDO systemctl is-enabled restic-backup.timer >/dev/null 2>&1 \
+    && ! $SUDO test -x /opt/stacks/_backup/backup.sh; then
+    warn "Persisted host-native restic state was true, but restic-backup.timer is not enabled and /opt/stacks/_backup/backup.sh is missing; clearing stale install intent"
+    INSTALL_RESTIC_HOST_NATIVE="false"
   fi
   EXIT_NODE_LAN_ACCESS="${PERSISTED_EXIT_NODE_LAN_ACCESS:-true}"
   DIRECT_PUBLIC_IP_AT_SETUP="$PERSISTED_DIRECT_PUBLIC_IP_AT_SETUP"
@@ -511,7 +332,23 @@ Options:
                              Applied LAST, after UFW/restic/connectivity are
                              verified, with probe + automatic rollback.
   --install-cloudflared      (server) Install and prepare Cloudflare Tunnel
-  --beszel-agent             Opt in to an agent connected to a manual Beszel hub
+  --beszel-agent             Opt in to a Beszel agent connected to a manual
+                              hub (addons/beszel-agent/install.sh, dispatched
+                              after exit-node apply)
+  --install-restic-host-native
+                              Opt in to the host-native restic systemd path
+                              (addons/restic-host-native/install.sh). Mutually
+                              exclusive with the lobaro container; the addon
+                              refuses while the restic-backup container is
+                              running.
+  --migrate-from-host-native   One-shot host-native → lobaro migration on an
+                              EXISTING node. Disables the host-native timer,
+                              pins /etc/restic/repo-id, reuses
+                              setup-restic.sh to deploy the lobaro container
+                              against the same repo (no re-init), verifies,
+                              and persists INSTALL_RESTIC_HOST_NATIVE=false.
+                              Idempotent: re-running on an already-migrated
+                              node is a no-op. See MIGRATION.md.
   --no-public-ssh            After Tailscale is verified, remove public SSH rules.
                               In non-interactive mode this flag IS the confirmation.
   --public-ssh               Explicitly reopen/keep public SSH (overrides lockdown).
@@ -543,6 +380,8 @@ for arg in "$@"; do
     --use-exit-node=*)     USE_EXIT_NODE="${arg#*=}" ;;
     --install-cloudflared) CLOUDFLARED_REQUESTED_THIS_RUN="true" ;;
     --beszel-agent)        BESZEL_AGENT_REQUESTED_THIS_RUN="true" ;;
+    --install-restic-host-native) RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="true" ;;
+    --migrate-from-host-native)  MIGRATE_FROM_HOST_NATIVE_THIS_RUN="true" ;;
     --no-public-ssh)       KEEP_PUBLIC_SSH="false" ;;
     --public-ssh)          KEEP_PUBLIC_SSH="true" ;;
     --ts-authkey=*)        TS_AUTHKEY="${arg#*=}" ;;
@@ -613,9 +452,22 @@ if [[ "$INSTALL_BESZEL_AGENT" != "true" \
     BESZEL_AGENT_REQUESTED_THIS_RUN="true"
   fi
 fi
-if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
-  beszel_collect_config
-  info "Beszel agent requested; it will be configured after Tailscale is ready"
+# Credential collection lives inside addons/beszel-agent/install.sh now
+# (WP5). bootstrap.sh only sets the request flag; the addon prompts for /
+# reads BESZEL_HUB_URL, BESZEL_AGENT_KEY, BESZEL_AGENT_TOKEN.
+
+# Symmetric prompt for the host-native restic addon. Skip when the lobaro
+# container is already running (the addon would refuse anyway, and the
+# user is unlikely to want to switch paths mid-bootstrap).
+if [[ "$INSTALL_RESTIC_HOST_NATIVE" != "true" \
+  && "${RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN:-false}" != "true" \
+  && is_interactive ]]; then
+  if command -v docker >/dev/null 2>&1 \
+    && docker inspect -f '{{.State.Running}}' restic-backup 2>/dev/null | grep -q '^true$'; then
+    info "Lobaro container detected; skipping the host-native restic prompt (mutually exclusive)."
+  elif confirm "Install host-native restic addon (mutually exclusive with lobaro)?"; then
+    RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="true"
+  fi
 fi
 
 if ! confirm "Proceed with bootstrap?"; then
@@ -653,19 +505,27 @@ fi
 # Never mutate an existing /opt/stacks tree: create missing directories only,
 # and chown exactly the directories we created (never recursive).
 info "Ensuring directory skeleton exists (no ownership changes to existing dirs)..."
-for d in /opt/stacks /opt/stacks/_backup /opt/stacks/_backup/pre; do
+for d in /opt/stacks /opt/stacks/_backup /opt/stacks/_backup/pre /opt/stacks/_system; do
   if [[ ! -d "$d" ]]; then
     $SUDO mkdir -p "$d"
     $SUDO chown "$REAL_USER:$REAL_USER" "$d"
     info "Created $d (owner: $REAL_USER)"
   fi
 done
+# /opt/homelab/env-file holds the Tailscale IP SSOT (AGENT.md §2).
+# mode 755 so non-root consumers can read it via env_file:/--env-file.
+$SUDO mkdir -p /opt/homelab/env-file
+$SUDO chmod 755 /opt/homelab/env-file
 $SUDO mkdir -p /etc/restic "$NODE_ENV_DIR"
 $SUDO chmod 700 /etc/restic
 
-# Copy static files if present next to this script
+# Copy static files if present next to this script. WP5 stopped copying
+# backup.sh + restic-backup.{service,timer} — those are now owned by the
+# restic-host-native addon and only installed when explicitly opted in.
+# change-restic-password.sh stays in the always-on baseline because the
+# lobaro container and the host-native addon both consume it.
 COPIED=0
-for f in backup.sh restic-backup.service restic-backup.timer RESTORE.md change-restic-password.sh check-node.sh lib.sh; do
+for f in RESTORE.md change-restic-password.sh check-node.sh lib.sh; do
   if [[ -f "$SCRIPT_DIR/$f" ]]; then
     $SUDO cp "$SCRIPT_DIR/$f" /opt/stacks/_backup/
     COPIED=$((COPIED + 1))
@@ -675,7 +535,6 @@ for f in backup.sh restic-backup.service restic-backup.timer RESTORE.md change-r
 done
 info "Copied $COPIED support file(s) into /opt/stacks/_backup/"
 
-$SUDO chmod 700 /opt/stacks/_backup/backup.sh 2>/dev/null || true
 $SUDO chmod 700 /opt/stacks/_backup/change-restic-password.sh 2>/dev/null || true
 $SUDO chmod 755 /opt/stacks/_backup/check-node.sh 2>/dev/null || true
 
@@ -727,6 +586,50 @@ if tailscale status >/dev/null 2>&1; then
   tailscale status | head -n 8 || true
 else
   warn "tailscale status returned non-zero – it may still be connecting. Continuing anyway."
+fi
+
+# ---------- 3a. Tailscale IP SSOT (AGENT.md §3 WP1) ----------
+# Copy _system/* into /opt/stacks/_system/, install the tailscaled drop-in,
+# enable the periodic refresh timer, and write the SSOT file once. This step
+# runs AFTER `tailscale up` and BEFORE UFW/restic so the IP is available to
+# every later step (and to the operator).
+SYSTEM_SRC="$SCRIPT_DIR/_system"
+SYSTEM_DST="/opt/stacks/_system"
+TS_DROPIN_DIR="/etc/systemd/system/tailscaled.service.d"
+
+if [[ -d "$SYSTEM_SRC" ]]; then
+  $SUDO mkdir -p "$SYSTEM_DST"
+  # Copy the writer + units + drop-in recursively, preserving *.d/ structure.
+  # `cp -a` preserves timestamps; later units/drop-ins are still picked up
+  # after daemon-reload.
+  $SUDO cp -a "$SYSTEM_SRC/." "$SYSTEM_DST/"
+  $SUDO chown -R root:root "$SYSTEM_DST"
+  $SUDO chmod 755 "$SYSTEM_DST/update-tailscale-ip.sh"
+  $SUDO chmod 644 "$SYSTEM_DST/update-tailscale-ip.service" \
+    "$SYSTEM_DST/update-tailscale-ip.timer" \
+    "$SYSTEM_DST/tailscaled.service.d/override.conf"
+
+  # Install the tailscaled drop-in so the writer also runs after every
+  # Tailscale restart.
+  $SUDO mkdir -p "$TS_DROPIN_DIR"
+  $SUDO install -m 644 "$SYSTEM_DST/tailscaled.service.d/override.conf" \
+    "$TS_DROPIN_DIR/override.conf"
+
+  $SUDO systemctl daemon-reload
+
+  # Run the writer once now. If Tailscale just came up it should succeed; if
+  # not, the timer will retry later.
+  if $SUDO "$SYSTEM_DST/update-tailscale-ip.sh"; then
+    info "Tailscale IP SSOT writer ran successfully"
+  else
+    warn "Tailscale IP SSOT writer did not produce a valid file yet (Tailscale may still be connecting)"
+  fi
+
+  # Periodic refresh.
+  $SUDO systemctl enable --now update-tailscale-ip.timer
+  info "Enabled update-tailscale-ip.timer (refreshes /opt/homelab/env-file/tailscale.env every 15 min)"
+else
+  warn "_system/ directory not found next to bootstrap.sh – skipping Tailscale IP SSOT setup"
 fi
 
 # ---------- 3b. Server exit-node prerequisite: IP forwarding ----------
@@ -908,6 +811,7 @@ write_node_env() {
     homelab_format_kv ADVERTISE_EXIT_NODE "$ADVERTISE_EXIT_NODE"
     homelab_format_kv INSTALL_CLOUDFLARED "$INSTALL_CLOUDFLARED"
     homelab_format_kv INSTALL_BESZEL_AGENT "$INSTALL_BESZEL_AGENT"
+    homelab_format_kv INSTALL_RESTIC_HOST_NATIVE "$INSTALL_RESTIC_HOST_NATIVE"
     homelab_format_kv EXIT_NODE_LAN_ACCESS "$EXIT_NODE_LAN_ACCESS"
     homelab_format_kv DIRECT_PUBLIC_IP_AT_SETUP "$DIRECT_PUBLIC_IP_AT_SETUP"
     homelab_format_kv KEEP_PUBLIC_SSH "$KEEP_PUBLIC_SSH"
@@ -967,6 +871,36 @@ if [[ -f "$SCRIPT_DIR/setup-restic.sh" ]]; then
 else
   warn "setup-restic.sh not found next to bootstrap.sh – skipping automated restic setup"
   info "You can run the restic wizard manually later."
+fi
+
+# ---------- 6b. Migration: host-native → lobaro (AGENT.md §3 WP7) ----------
+# Opt-in only; runs when --migrate-from-host-native was passed THIS run.
+# Delegates all logic to migrate-to-lobaro.sh (dedicated helper). The helper
+# is idempotent: re-running on an already-migrated node is a no-op exit 0;
+# running on a node without a host-native timer refuses (wrong tool).
+#
+# Placement: AFTER step 6 (restic setup) so /etc/restic/{env,password}
+# already exist, and BEFORE step 7 (write_node_env) so the persisted
+# INSTALL_RESTIC_HOST_NATIVE=false from the helper lands in the same
+# write. Also BEFORE step 9 (addon dispatch) so the host-native addon
+# does not run against a freshly-deployed lobaro container.
+if [[ "$MIGRATE_FROM_HOST_NATIVE_THIS_RUN" == "true" ]]; then
+  if [[ ! -r "$SCRIPT_DIR/migrate-to-lobaro.sh" ]]; then
+    error "migrate-to-lobaro.sh is missing next to bootstrap.sh. Refusing to set --migrate-from-host-native without the helper."
+  fi
+  info "Running host-native → lobaro migration helper..."
+  # Forward HOMELAB_NONINTERACTIVE so the helper does not prompt twice.
+  export HOMELAB_NONINTERACTIVE
+  if ! bash "$SCRIPT_DIR/migrate-to-lobaro.sh"; then
+    error "Migration helper failed. The host-native timer is now disabled; see MIGRATION.md for the rollback recipe. No snapshots were deleted."
+  fi
+  # The helper persisted INSTALL_RESTIC_HOST_NATIVE=false via addon_persist_flag.
+  # Reload it from /etc/homelab/node.env so step 7's write_node_env does NOT
+  # overwrite the helper's flag with the legacy "true" loaded at startup.
+  INSTALL_RESTIC_HOST_NATIVE=""
+  if homelab_load_kv_sudo "$SUDO" /etc/homelab/node.env INSTALL_RESTIC_HOST_NATIVE; then
+    :
+  fi
 fi
 
 # ---------- 7. Persist desired state after base/restic convergence ----------
@@ -1058,16 +992,39 @@ elif [[ "$ROLE" == "client" && -z "$USE_EXIT_NODE" ]]; then
   warn "This node will have Tailscale but no forced exit-node routing."
 fi
 
-# ---------- 9. Optional Beszel agent ------------------------------------------
-if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
-  info "Configuring Beszel agent under $BESZEL_AGENT_STACK_DIR..."
-  if ! configure_beszel_agent; then
-    error "Beszel agent configuration failed; INSTALL_BESZEL_AGENT was not changed. Fix the issue and re-run with --beszel-agent."
+# ---------- 9. Addon dispatch (after core is complete) ----------------------
+# Addons are explicit opt-ins (--beszel-agent, --install-restic-host-native).
+# Core safety — Tailscale, UFW, lobaro container, exit-node routing — has
+# already converged above; an addon failure here aborts the bootstrap run
+# but does NOT roll back the lobaro container, firewall, or Tailscale state.
+# Re-run with the same flags after fixing the underlying issue.
+#
+# Each addon installer is responsible for its own INSTALL_* flag persistence
+# (validate → atomic write → start → verify running → only then persist).
+# bootstrap.sh only dispatches and surfaces failures.
+dispatch_addon() {
+  local addon_path="$1" addon_label="$2"
+  if [[ ! -r "$addon_path" ]]; then
+    error "Addon installer is missing: $addon_path"
   fi
-  # Persist only after the Compose project and running container were verified.
-  INSTALL_BESZEL_AGENT="true"
-  write_node_env
-  info "Beszel agent configured successfully"
+  info "Dispatching addon: $addon_label ($addon_path)"
+  if ! bash "$addon_path"; then
+    error "Addon '$addon_label' failed. Core bootstrap succeeded; the failed addon did not roll back core state. Re-run with the same opt-in flag after fixing the issue."
+  fi
+  INSTALL_BESZEL_AGENT="${PERSISTED_INSTALL_BESZEL_AGENT:-false}"
+  # Reload the persisted state so the final-notes block sees the freshly-
+  # written INSTALL_* flag(s) without needing a second read pass.
+  if [[ -f "$NODE_ENV_FILE" ]] && [[ "$LIB_LOADED" != "true" ]]; then
+    # lib.sh is already sourced at the top; nothing to do.
+    :
+  fi
+}
+
+if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" == "true" ]]; then
+  dispatch_addon "$BESZEL_ADDON" "beszel-agent"
+fi
+if [[ "${RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN:-false}" == "true" ]]; then
+  dispatch_addon "$RESTIC_HOST_NATIVE_ADDON" "restic-host-native"
 fi
 
 # ---------- 10. Final notes ----------
@@ -1082,15 +1039,17 @@ Node name   : $NODE_NAME
 Stacks dir  : /opt/stacks
 Restic conf : /etc/restic/
 Node state  : $NODE_ENV_FILE
+Tailscale IP: /opt/homelab/env-file/tailscale.env  (single source of truth)
 Health check: /opt/stacks/_backup/check-node.sh (exit code != 0 means problems)
 
 Next steps:
   1. Run health check:
        sudo /opt/stacks/_backup/check-node.sh
-  2. Run a manual backup:
-       sudo /opt/stacks/_backup/backup.sh
-   3. Check snapshots:
-        sudo bash -c 'source /opt/stacks/_backup/lib.sh; homelab_restic snapshots'
+  2. The lobaro container schedules its own backups (UTC, spread per-node).
+     To force a manual run:
+       sudo docker exec restic-backup /bin/backup
+  3. Check snapshots:
+       sudo bash -c 'source /opt/stacks/_backup/lib.sh; homelab_restic snapshots'
   4. (Server + exit-node) Approve the exit node in the Tailscale admin console
   5. (Client) Verify internet works through the exit node:
        curl -4 ifconfig.me

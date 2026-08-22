@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Tailscale IP SSOT file every 15 minutes
+Documentation=man:tailscale(1)
+
+[Timer]
+# OnCalendar=*:0/15 fires at minute :00, :15, :30, :45 every hour.
+OnCalendar=*:0/15
+# Run shortly after boot if a scheduled window was missed.
+Persistent=true
+Unit=update-tailscale-ip.service
+
+[Install]
+WantedBy=timers.target

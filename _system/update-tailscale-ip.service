@@ -1,0 +1,15 @@
+[Unit]
+Description=Write Tailscale IP SSOT file (/opt/homelab/env-file/tailscale.env)
+Documentation=man:tailscale(1)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/stacks/_system/update-tailscale-ip.sh
+# Defensive defaults; the script already refuses to overwrite with invalid data.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/homelab/env-file

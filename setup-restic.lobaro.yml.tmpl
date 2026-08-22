@@ -1,0 +1,54 @@
+# setup-restic.lobaro.yml.tmpl — template for the lobaro restic-backup-docker
+# Compose stack (AGENT.md §3 WP2).
+#
+# Placeholders (in __CAPS__) are substituted by setup-restic.sh via sed before
+# the file is installed at /opt/stacks/restic-backup/docker-compose.yml. The
+# substituted values replace the placeholders in-place below; the lines below
+# are the live values once installed (sed rewrites them on every setup).
+#   __NODE_NAME__              stable, immutable node identity
+#   __BACKUP_CRON__            cron expression for the backup window (UTC)
+#   __CHECK_CRON__             cron expression for weekly `restic check`
+#                              (UTC); empty disables the check
+#   __RESTIC_FORGET_ARGS__     retention policy (already shell-safe quoted);
+#                              empty means no `restic forget` after backup
+#   __RESTIC_JOB_ARGS__        extra args for `restic backup` (e.g. excludes)
+#
+# Substituted via sed (delimiter `|`) so any character in the values is fine
+# except the literal `__TOKEN__` names.
+#
+# Notes:
+#   - Secrets live ONLY under /etc/restic. The whole directory is mounted
+#     read-only into the container so an atomic `mv /etc/restic/password`
+#     is visible to the next backup invocation without a container restart.
+#   - RESTIC_PASSWORD is NEVER passed via environment. The container reads
+#     the password file via RESTIC_PASSWORD_FILE.
+#   - env_file reads /etc/restic/env.docker which contains only AWS_* and
+#     RESTIC_* in raw KEY=VALUE form (no shell quoting — Compose does not
+#     interpret shell metacharacters in env_file).
+
+services:
+  restic-backup:
+    image: ghcr.io/lobaro/restic-backup-docker:latest
+    container_name: restic-backup
+    hostname: __NODE_NAME__
+    restart: unless-stopped
+    # The container's CMD is `tail -fn0 /var/log/cron.log`, which keeps the
+    # container alive and forwards cron output to `docker logs`.
+    volumes:
+      # Backup the entire /opt/stacks tree read-only.
+      - /opt/stacks:/data:ro
+      # Whole /etc/restic directory, read-only. Atomic `mv` of password
+      # inside this directory is picked up by the next backup run.
+      - /etc/restic:/etc/restic:ro
+    # Raw KEY=VALUE pairs only. No shell quoting (Compose env_file is
+    # literal). No password here — RESTIC_PASSWORD_FILE points inside the
+    # read-only /etc/restic volume.
+    env_file:
+      - /etc/restic/env.docker
+    environment:
+      - RESTIC_PASSWORD_FILE=/etc/restic/password
+      - RESTIC_TAG=__NODE_NAME__
+      - BACKUP_CRON=__BACKUP_CRON__
+      - CHECK_CRON=__CHECK_CRON__
+      - RESTIC_FORGET_ARGS=__RESTIC_FORGET_ARGS__
+      - RESTIC_JOB_ARGS=__RESTIC_JOB_ARGS__

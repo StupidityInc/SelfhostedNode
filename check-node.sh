@@ -47,6 +47,8 @@ EXIT_NODE_APPLIED=""
 ADVERTISE_EXIT_NODE=""
 DIRECT_PUBLIC_IP_AT_SETUP=""
 KEEP_PUBLIC_SSH=""
+INSTALL_BESZEL_AGENT=""
+INSTALL_RESTIC_HOST_NATIVE=""
 NODE_ENV_READABLE="false"
 if [[ "$LIB_LOADED" == "true" ]] && $SUDO test -r /etc/homelab/node.env 2>/dev/null; then
   if ! homelab_load_kv_sudo "$SUDO" /etc/homelab/node.env "${HOMELAB_NODE_ENV_KEYS[@]}"; then
@@ -128,6 +130,56 @@ else
 fi
 echo
 
+# ---------- Tailscale IP SSOT (AGENT.md §3 WP1) ----------
+echo "── Tailscale IP SSOT ──"
+TS_SSOT_FILE="/opt/homelab/env-file/tailscale.env"
+TS_SSOT_IP=""
+TS_SSOT_VALID="false"
+TS_SSOT_PRESENT="false"
+if $SUDO test -r "$TS_SSOT_FILE" 2>/dev/null; then
+  TS_SSOT_PRESENT="true"
+  line="$($SUDO head -n 1 "$TS_SSOT_FILE" 2>/dev/null || true)"
+  line="${line%$'\r'}"
+  if [[ "$line" =~ ^TAILSCALE_IP=(.*)$ ]]; then
+    raw="${BASH_REMATCH[1]}"
+    if [[ "$raw" =~ ^\'(.*)\'$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+    elif [[ "$raw" =~ ^\"(.*)\"$ ]]; then
+      raw="${BASH_REMATCH[1]}"
+    fi
+    TS_SSOT_IP="$raw"
+  fi
+  if [[ "$LIB_LOADED" == "true" ]] && homelab_validate_tailscale_ip "$TS_SSOT_IP"; then
+    TS_SSOT_VALID="true"
+    ok "Tailscale IP SSOT file present and valid: $TS_SSOT_IP"
+  else
+    fail "Tailscale IP SSOT file exists but value is invalid: '${TS_SSOT_IP:-<empty>}'"
+  fi
+else
+  fail "Tailscale IP SSOT file missing: $TS_SSOT_FILE"
+fi
+
+# Cross-reference the file against the live tailscale IP when the daemon is up.
+# We only WARN (not fail) when Tailscale is genuinely down — the SSOT file is
+# allowed to lag until Tailscale reconnects.
+if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  LIVE_TS_IP="$(tailscale ip -4 2>/dev/null | awk '/^100\.(6[4-9]|7[0-9]|8[0-9]|9[0-9]|10[0-9]|11[0-9]|12[0-7])\./ {print; exit}')"
+  if [[ -n "$LIVE_TS_IP" ]]; then
+    if [[ "$LIVE_TS_IP" == "$TS_SSOT_IP" ]]; then
+      ok "Tailscale IP SSOT matches live tailscale IP ($LIVE_TS_IP)"
+    else
+      if [[ "$TS_SSOT_VALID" == "true" ]]; then
+        fail "Tailscale IP SSOT ($TS_SSOT_IP) disagrees with live tailscale IP ($LIVE_TS_IP)"
+      else
+        warn "Live tailscale IP is $LIVE_TS_IP but the SSOT file is invalid; a successful update-tailscale-ip.sh run will repair it"
+      fi
+    fi
+  else
+    warn "tailscale is up but no CGNAT IPv4 was returned"
+  fi
+fi
+echo
+
 # ---------- Network path ----------
 echo "── Outbound connectivity ──"
 PUBLIC_IP="$(curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null || echo "unreachable")"
@@ -193,21 +245,78 @@ echo
 echo "── Restic backup ──"
 if $SUDO test -f /etc/restic/env 2>/dev/null; then
   ok "/etc/restic/env exists"
+else
+  fail "/etc/restic/env missing – restic not configured on this node"
+fi
 
-  # Timer state (display via list-timers; no fragile LastTriggerUSec parsing)
-  if systemctl is-enabled restic-backup.timer >/dev/null 2>&1; then
+# --- Backup path detection (lobaro vs host-native addon vs none vs both) ---
+# WP5: prefer the persisted INSTALL_RESTIC_HOST_NATIVE flag (from /etc/homelab/node.env);
+# the unit-file heuristic in homelab_backup_path stays as a fallback when the
+# flag is unset or false. See AGENT.md §3 WP5.
+BACKUP_PATH="$(homelab_backup_path "$SUDO" "${INSTALL_RESTIC_HOST_NATIVE:-}" 2>/dev/null || echo "none")"
+case "$BACKUP_PATH" in
+  lobaro)
+    ok "Backup path: lobaro container"
+    ;;
+  host-native)
+    if [[ "${INSTALL_RESTIC_HOST_NATIVE:-}" == "true" ]]; then
+      ok "Backup path: host-native (restic-host-native addon, flag persisted)"
+    else
+      ok "Backup path: host-native (restic-backup.timer detected, no INSTALL_RESTIC_HOST_NATIVE flag)"
+    fi
+    ;;
+  both)
+    warn "Backup path: BOTH lobaro container AND host-native timer are active (mutually exclusive)"
+    ;;
+  *)
+    fail "No backup path active (lobaro container not running AND restic-backup.timer not enabled)"
+    ;;
+esac
+
+# --- Lobaro container health (only meaningful when lobaro is in the mix) ---
+LOBARO_RUNNING="false"
+if command -v docker >/dev/null 2>&1; then
+  LOBARO_RUNNING="$($SUDO docker inspect -f '{{.State.Running}}' restic-backup 2>/dev/null || echo "false")"
+fi
+if [[ "$BACKUP_PATH" == "lobaro" || "$BACKUP_PATH" == "both" ]]; then
+  if [[ "$LOBARO_RUNNING" == "true" ]]; then
+    ok "restic-backup container is running"
+  else
+    fail "restic-backup container is not running (start with: sudo docker compose --env-file /opt/stacks/restic-backup/.env -f /opt/stacks/restic-backup/docker-compose.yml up -d)"
+  fi
+fi
+
+# --- Container error log secondary signal (cheap; WARN only) ---
+# Only inspect when the container is running. One grep, last 200 lines.
+# Pattern is intentionally narrow to avoid benign stderr noise from the
+# lobaro image (which BusyBox-cron'd services often emit).
+if [[ "$LOBARO_RUNNING" == "true" ]] && command -v docker >/dev/null 2>&1; then
+  CONTAINER_ERR_COUNT="$($SUDO docker logs restic-backup --tail 200 2>/dev/null \
+    | grep -cE '(^|[^A-Za-z])(ERROR|FATAL|Error:)' || true)"
+  if [[ "${CONTAINER_ERR_COUNT:-0}" -gt 0 ]]; then
+    warn "restic-backup container log mentions $CONTAINER_ERR_COUNT error-like line(s) in the last 200 lines (review with: sudo docker logs restic-backup --tail 200)"
+  fi
+fi
+
+# --- Host-native timer checks (only when the addon is enabled) ---
+HOST_NATIVE_ENABLED="false"
+if $SUDO systemctl is-enabled restic-backup.timer >/dev/null 2>&1; then
+  HOST_NATIVE_ENABLED="true"
+fi
+if [[ "$HOST_NATIVE_ENABLED" == "true" ]]; then
+  if $SUDO systemctl is-enabled restic-backup.timer >/dev/null 2>&1; then
     ok "restic-backup.timer is enabled"
   else
-    fail "restic-backup.timer is not enabled"
+    fail "restic-backup.timer is enabled (per detection) but is-enabled check failed"
   fi
-  if systemctl is-active --quiet restic-backup.timer 2>/dev/null; then
+  if $SUDO systemctl is-active --quiet restic-backup.timer 2>/dev/null; then
     ok "restic-backup.timer is running"
   else
     fail "restic-backup.timer is not running (start with: sudo systemctl enable --now restic-backup.timer)"
   fi
-  systemctl list-timers --all --no-pager restic-backup.timer 2>/dev/null | sed 's/^/  /' || true
+  $SUDO systemctl list-timers --all --no-pager restic-backup.timer 2>/dev/null | sed 's/^/  /' || true
 
-  BACKUP_RESULT="$(systemctl show -p Result --value restic-backup.service 2>/dev/null || true)"
+  BACKUP_RESULT="$($SUDO systemctl show -p Result --value restic-backup.service 2>/dev/null || true)"
   case "$BACKUP_RESULT" in
     failed|timeout|exit-code|signal|core-dump|resources|watchdog|oom-kill)
       fail "Last restic-backup.service run ended with Result=$BACKUP_RESULT"
@@ -216,34 +325,83 @@ if $SUDO test -f /etc/restic/env 2>/dev/null; then
       warn "Could not inspect the last restic-backup.service result"
       ;;
   esac
+fi
 
-  # Snapshot freshness – the real backup-health signal
-  if $SUDO test -r /etc/restic/env 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.sh" ]]; then
-    set +e
-    NEWEST_SNAP="$($SUDO bash -c 'source "$1"; homelab_restic snapshots --json --latest 1 2>/dev/null' _ "$SCRIPT_DIR/lib.sh" | jq -r '.[0].time // empty' 2>/dev/null)"
-    set -e
-    if [[ -z "$NEWEST_SNAP" ]]; then
-      fail "No snapshots found (or repository unreachable / wrong credentials)"
+# --- Repo-id match (when /etc/restic/repo-id is present) ---
+# Independent of which backup path is active: the pin is a property of the
+# repo, not the scheduler. Read the pin, compare to live `restic cat config`.
+if $SUDO test -r "$HOMELAB_REPO_ID_FILE" 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.sh" ]]; then
+  set +e
+  REPO_ID_REPORT="$($SUDO bash -c '
+    source "$1"
+    HOMELAB_REPO_ID=""
+    homelab_repo_id
+    if [[ -z "$HOMELAB_REPO_ID" ]]; then
+      echo "BAD_PIN"
+      exit 0
+    fi
+    PIN="$HOMELAB_REPO_ID"
+    if ! LIVE="$(restic cat config --json 2>/dev/null | jq -r ".id // empty" 2>/dev/null)"; then
+      echo "LIVE_UNREACHABLE"
+      exit 0
+    fi
+    if [[ -z "$LIVE" ]]; then
+      echo "LIVE_NO_ID"
+      exit 0
+    fi
+    if [[ "$LIVE" != "$PIN" ]]; then
+      echo "MISMATCH pin=$PIN live=$LIVE"
+      exit 0
+    fi
+    echo "MATCH $PIN"
+  ' _ "$SCRIPT_DIR/lib.sh" 2>/dev/null)"
+  set -e
+  case "$REPO_ID_REPORT" in
+    MATCH*)
+      ok "/etc/restic/repo-id matches live repository"
+      ;;
+    MISMATCH*)
+      fail "/etc/restic/repo-id mismatch (${REPO_ID_REPORT#MISMATCH })"
+      ;;
+    BAD_PIN)
+      fail "/etc/restic/repo-id exists but is not a 32-char hex UUID"
+      ;;
+    LIVE_UNREACHABLE)
+      warn "Could not read live repository config to verify repo-id pin (network? credentials?)"
+      ;;
+    LIVE_NO_ID)
+      fail "Live restic repository returned no id; cannot verify repo-id pin"
+      ;;
+    *)
+      warn "Repo-id pin verification inconclusive: '$REPO_ID_REPORT'"
+      ;;
+  esac
+fi
+
+# --- Snapshot freshness – host restic is still the ground truth (AGENT.md §2) ---
+if $SUDO test -r /etc/restic/env 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.sh" ]]; then
+  set +e
+  NEWEST_SNAP="$($SUDO bash -c 'source "$1"; homelab_restic snapshots --json --latest 1 2>/dev/null' _ "$SCRIPT_DIR/lib.sh" | jq -r '.[0].time // empty' 2>/dev/null)"
+  set -e
+  if [[ -z "$NEWEST_SNAP" ]]; then
+    fail "No snapshots found (or repository unreachable / wrong credentials)"
+  else
+    STALE_HOURS="${STALE_HOURS:-36}"
+    NOW_EPOCH="$(date +%s)"
+    SNAP_EPOCH="$(date -d "$NEWEST_SNAP" +%s 2>/dev/null || echo 0)"
+    if [[ "$SNAP_EPOCH" == "0" ]]; then
+      warn "Could not parse snapshot timestamp '$NEWEST_SNAP'"
     else
-      STALE_HOURS="${STALE_HOURS:-36}"
-      NOW_EPOCH="$(date +%s)"
-      SNAP_EPOCH="$(date -d "$NEWEST_SNAP" +%s 2>/dev/null || echo 0)"
-      if [[ "$SNAP_EPOCH" == "0" ]]; then
-        warn "Could not parse snapshot timestamp '$NEWEST_SNAP'"
+      AGE_H=$(( (NOW_EPOCH - SNAP_EPOCH) / 3600 ))
+      if (( AGE_H > STALE_HOURS )); then
+        fail "Newest snapshot is ${AGE_H}h old (> ${STALE_HOURS}h) – BACKUPS ARE STALE"
       else
-        AGE_H=$(( (NOW_EPOCH - SNAP_EPOCH) / 3600 ))
-        if (( AGE_H > STALE_HOURS )); then
-          fail "Newest snapshot is ${AGE_H}h old (> ${STALE_HOURS}h) – BACKUPS ARE STALE. Check: systemctl status restic-backup.service"
-        else
-          ok "Newest snapshot is ${AGE_H}h old (limit ${STALE_HOURS}h)"
-        fi
+        ok "Newest snapshot is ${AGE_H}h old (limit ${STALE_HOURS}h)"
       fi
     fi
-  else
-    fail "Cannot safely read /etc/restic/env or the installed lib.sh – skipping snapshot freshness check"
   fi
 else
-  fail "/etc/restic/env missing – restic not configured on this node"
+  fail "Cannot safely read /etc/restic/env or the installed lib.sh – skipping snapshot freshness check"
 fi
 echo
 
