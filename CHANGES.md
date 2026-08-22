@@ -1,5 +1,57 @@
 # Changes
 
+## 2026-08-22 (laptop-1 bootstrap fixes)
+
+Bugs found on the first real-server bootstrap run, no scope creep.
+
+`lib.sh`:
+
+- `homelab_repo_id` / `homelab_assert_repo_id_pinned` — accept the
+  restic 64-char lowercase-hex repository id (restic stores a 32-byte
+  random as hex; the previous 32-char regex silently dropped every
+  real value). All related error messages updated to match.
+- `homelab_assert_repo_id_pinned` now loads `/etc/restic/env` via
+  `homelab_load_restic_env` itself before running `restic cat config`,
+  so callers don't need to remember a non-obvious prerequisite. The
+  env file is read with the safe non-sourcing loader — never `source`d
+  as shell, so secrets stay out of any expansion path. A clear error
+  is raised when `RESTIC_REPOSITORY` ends up empty.
+
+`check-node.sh`:
+
+- Repo-id verifier subshell now also loads env via the safe loader
+  before `restic cat config`. Reports a new `NO_ENV` failure when the
+  pin exists but `/etc/restic/env` is missing/empty (previously this
+  surfaced as a generic `LIVE_UNREACHABLE` warn). `BAD_PIN` message
+  updated to match the new 64-char hex format.
+
+`_system/tailscaled.service.d/override.conf`:
+
+- `ExecStartPost=` now uses the leading `-` (`ExecStartPost=-/opt/stacks/
+  _system/update-tailscale-ip.sh`). A non-zero exit from the SSOT
+  writer (Tailscale still settling, no CGNAT IPv4 yet, disk pressure)
+  no longer marks `tailscaled.service` as failed or blocks Tailscale
+  from coming up.
+
+`bootstrap.sh`:
+
+- WP1 install flow now copies `update-tailscale-ip.{service,timer}`
+  into `/etc/systemd/system/` (in addition to the working copy under
+  `/opt/stacks/_system/`) and reorders `daemon-reload` so it runs
+  *before* `systemctl enable --now update-tailscale-ip.timer`. This
+  fixes the first-boot failure where the units were visible to the
+  drop-in `ExecStart=` reference but invisible to systemd, so the
+  timer enable failed with "Failed to enable unit".
+
+`setup-restic.sh`:
+
+- `RESTIC_FORGET_ARGS` default was the Compose `-e "..."` form, which
+  produced a malformed `RESTIC_FORGET_ARGS` env value inside the
+  lobaro container and made `restic forget` fail in the live log. The
+  default is now the bare restic `forget` flags (the only thing the
+  Compose template expects); regenerating the compose file writes the
+  clean value.
+
 ## 2026-08-22 (WP8)
 
 Interactive bootstrap UX — operators can now complete optional choices

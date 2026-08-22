@@ -255,22 +255,33 @@ homelab_repo_id() {
     local line
     line="$(head -n 1 "$HOMELAB_REPO_ID_FILE" 2>/dev/null || true)"
     line="${line%$'\r'}"
-    # 32-char lowercase hex; conservative validation. Reject anything else.
-    if [[ "$line" =~ ^[0-9a-f]{32}$ ]]; then
+    # 64-char lowercase hex; this is what restic `cat config --json | .id`
+    # returns for the repository id field (restic stores it as a 32-byte
+    # random value, hex-encoded to 64 chars). Reject anything else.
+    if [[ "$line" =~ ^[0-9a-f]{64}$ ]]; then
       HOMELAB_REPO_ID="$line"
     fi
   fi
 }
 
-# Verify the pinned repo-id matches the live restic repository. Reads
-# /etc/restic/env for credentials (use homelab_load_restic_env beforehand if
-# you need to scope the load). Returns 0 when the IDs match; 1 when the pin
-# is missing, the live repository is unreachable, or the IDs differ. Sets
+# Verify the pinned repo-id matches the live restic repository. Loads
+# /etc/restic/env (the restic cache, repository, and password-file path)
+# via the safe non-sourcing loader homelab_load_restic_env, then runs
+# `restic cat config --json` and compares the live id field to the pinned
+# value. Returns 0 when the IDs match; 1 when the pin is missing, the
+# live repository is unreachable, or the IDs differ. Sets
 # HOMELAB_REPO_ID_LIVE so callers can decide whether to fail or repair.
+#
+# The function deliberately calls homelab_load_restic_env itself rather
+# than relying on the caller: `restic cat config` needs AWS_* +
+# RESTIC_REPOSITORY + RESTIC_PASSWORD_FILE in its environment, and a
+# forgotten load has been the source of live-node bootstrap failures
+# (the file IS safe to read, but must not be `source`d as shell — secrets
+# must never round-trip through shell expansion).
 homelab_assert_repo_id_pinned() {
   homelab_repo_id
   if [[ -z "$HOMELAB_REPO_ID" ]]; then
-    echo "ERROR: $HOMELAB_REPO_ID_FILE is missing or does not contain a 32-char hex UUID." >&2
+    echo "ERROR: $HOMELAB_REPO_ID_FILE is missing or does not contain a 64-char lowercase hex restic repository id." >&2
     echo "       Refusing to operate without a pinned repo-id (AGENT.md §2 Backup)." >&2
     return 1
   fi
@@ -278,12 +289,26 @@ homelab_assert_repo_id_pinned() {
     echo "ERROR: restic binary is required for repo-id verification." >&2
     return 1
   fi
-  # Use the host restic with /etc/restic/env credentials. Caller must have
-  # loaded the env already (typical in setup-restic.sh).
-  if ! HOMELAB_REPO_ID_LIVE="$(restic cat config --json 2>/dev/null | jq -r '.id // empty' 2>/dev/null)"; then
-    echo "ERROR: could not read live repository config with host restic." >&2
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required for repo-id verification." >&2
     return 1
   fi
+  # Load credentials the same way backup.sh / check-node.sh do: never
+  # `source` the env file. homelab_load_restic_env is a no-op when the
+  # file is missing, so we still get a clear `restic` error path.
+  homelab_load_restic_env /etc/restic/env
+  if [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
+    echo "ERROR: RESTIC_REPOSITORY is not set after loading /etc/restic/env." >&2
+    echo "       Cannot read live repository config with host restic." >&2
+    return 1
+  fi
+  local raw_live
+  if ! raw_live="$(restic cat config --json 2>/dev/null)"; then
+    echo "ERROR: could not read live repository config with host restic." >&2
+    echo "       Check RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, and the network path to the backend." >&2
+    return 1
+  fi
+  HOMELAB_REPO_ID_LIVE="$(printf '%s' "$raw_live" | jq -r '.id // empty' 2>/dev/null || true)"
   if [[ -z "$HOMELAB_REPO_ID_LIVE" ]]; then
     echo "ERROR: live restic repository returned no id." >&2
     return 1

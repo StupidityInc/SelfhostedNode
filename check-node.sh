@@ -341,10 +341,19 @@ if $SUDO test -r "$HOMELAB_REPO_ID_FILE" 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.s
       exit 0
     fi
     PIN="$HOMELAB_REPO_ID"
-    if ! LIVE="$(restic cat config --json 2>/dev/null | jq -r ".id // empty" 2>/dev/null)"; then
-      echo "LIVE_UNREACHABLE"
+    # Load credentials via the safe non-sourcing loader so `restic cat
+    # config` sees RESTIC_REPOSITORY + RESTIC_PASSWORD_FILE + AWS_*.
+    # homelab_load_restic_env is a no-op when /etc/restic/env is missing.
+    homelab_load_restic_env /etc/restic/env
+    if [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
+      echo "NO_ENV"
       exit 0
     fi
+    raw_live="$(restic cat config --json 2>/dev/null)" || {
+      echo "LIVE_UNREACHABLE"
+      exit 0
+    }
+    LIVE="$(printf "%s" "$raw_live" | jq -r ".id // empty" 2>/dev/null || true)"
     if [[ -z "$LIVE" ]]; then
       echo "LIVE_NO_ID"
       exit 0
@@ -364,7 +373,10 @@ if $SUDO test -r "$HOMELAB_REPO_ID_FILE" 2>/dev/null && [[ -r "$SCRIPT_DIR/lib.s
       fail "/etc/restic/repo-id mismatch (${REPO_ID_REPORT#MISMATCH })"
       ;;
     BAD_PIN)
-      fail "/etc/restic/repo-id exists but is not a 32-char hex UUID"
+      fail "/etc/restic/repo-id exists but is not a 64-char lowercase hex restic id"
+      ;;
+    NO_ENV)
+      fail "/etc/restic/repo-id is pinned but /etc/restic/env is missing or empty – cannot verify the pin"
       ;;
     LIVE_UNREACHABLE)
       warn "Could not read live repository config to verify repo-id pin (network? credentials?)"

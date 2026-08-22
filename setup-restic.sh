@@ -364,9 +364,16 @@ CHECK_CRON_VAL="${check_minute} ${check_hour} * * ${CHECK_DOW}"
 
 # ---------- Retention policy (RESTIC_FORGET_ARGS) ----------
 # Conservative defaults that survive a single-node failure but don't grow
-# unbounded. Override before running setup-restic.sh by exporting
-# RESTIC_FORGET_ARGS (a literal string, not shell-escaped).
-RESTIC_FORGET_ARGS_VAL="${RESTIC_FORGET_ARGS:--e \"RESTIC_FORGET_ARGS=--prune --keep-last 10 --keep-hourly 24 --keep-daily 7 --keep-weekly 52 --keep-monthly 120 --keep-yearly 100\"}"
+# unbounded. The value is substituted as a single YAML scalar into the
+# Compose file (see setup-restic.lobaro.yml.tmpl:
+# `RESTIC_FORGET_ARGS=__RESTIC_FORGET_ARGS__`) — it must therefore be ONLY
+# the restic `forget` flags, NOT a Compose `-e "..."` fragment. An earlier
+# version embedded the Compose `-e "..."` form here, which caused the
+# container to receive a malformed RESTIC_FORGET_ARGS environment value
+# and `restic forget` to fail in the lobaro log.
+# Override before running setup-restic.sh by exporting RESTIC_FORGET_ARGS
+# to a literal string of flags (no shell escaping required).
+RESTIC_FORGET_ARGS_VAL="${RESTIC_FORGET_ARGS:---prune --keep-last 10 --keep-hourly 24 --keep-daily 7 --keep-weekly 52 --keep-monthly 120 --keep-yearly 100}"
 
 # ---------- Per-backup extra args ----------
 RESTIC_JOB_ARGS_VAL="${RESTIC_JOB_ARGS:-}"

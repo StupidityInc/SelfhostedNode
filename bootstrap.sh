@@ -710,7 +710,8 @@ fi
 # every later step (and to the operator).
 SYSTEM_SRC="$SCRIPT_DIR/_system"
 SYSTEM_DST="/opt/stacks/_system"
-TS_DROPIN_DIR="/etc/systemd/system/tailscaled.service.d"
+SYSTEMD_UNIT_DIR="/etc/systemd/system"
+TS_DROPIN_DIR="$SYSTEMD_UNIT_DIR/tailscaled.service.d"
 
 if [[ -d "$SYSTEM_SRC" ]]; then
   $SUDO mkdir -p "$SYSTEM_DST"
@@ -724,12 +725,26 @@ if [[ -d "$SYSTEM_SRC" ]]; then
     "$SYSTEM_DST/update-tailscale-ip.timer" \
     "$SYSTEM_DST/tailscaled.service.d/override.conf"
 
+  # Install the unit files into /etc/systemd/system/ so systemd actually
+  # picks them up. /opt/stacks/_system/ is a working copy for the
+  # `ExecStart=` paths and drop-in references — units placed ONLY under
+  # /opt/stacks/_system/ are invisible to systemd and `systemctl enable
+  # --now update-tailscale-ip.timer` fails with "Failed to enable unit".
+  # This was the first failure observed on a live first-bootstrap node.
+  $SUDO install -m 644 "$SYSTEM_DST/update-tailscale-ip.service" \
+    "$SYSTEMD_UNIT_DIR/update-tailscale-ip.service"
+  $SUDO install -m 644 "$SYSTEM_DST/update-tailscale-ip.timer" \
+    "$SYSTEMD_UNIT_DIR/update-tailscale-ip.timer"
+
   # Install the tailscaled drop-in so the writer also runs after every
   # Tailscale restart.
   $SUDO mkdir -p "$TS_DROPIN_DIR"
   $SUDO install -m 644 "$SYSTEM_DST/tailscaled.service.d/override.conf" \
     "$TS_DROPIN_DIR/override.conf"
 
+  # Daemon-reload BEFORE `systemctl enable --now`: without it systemd
+  # has not yet seen the units we just installed and the first-boot
+  # enable fails on a fresh node.
   $SUDO systemctl daemon-reload
 
   # Run the writer once now. If Tailscale just came up it should succeed; if
@@ -740,7 +755,8 @@ if [[ -d "$SYSTEM_SRC" ]]; then
     warn "Tailscale IP SSOT writer did not produce a valid file yet (Tailscale may still be connecting)"
   fi
 
-  # Periodic refresh.
+  # Periodic refresh. Now safe — units are installed and daemon-reload
+  # has run, so systemd can resolve the name.
   $SUDO systemctl enable --now update-tailscale-ip.timer
   info "Enabled update-tailscale-ip.timer (refreshes /opt/homelab/env-file/tailscale.env every 15 min)"
 else
