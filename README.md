@@ -69,6 +69,30 @@ export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT`,
 and printed once. To add a recovery key non-interactively, also provide
 `RESTIC_RECOVERY_PASSWORD_FILE`).
 
+### Interactive mode
+
+On a TTY, `bootstrap.sh` prompts for optional choices (cloudflared,
+Beszel agent, advertise/use exit node, host-native → lobaro migration)
+instead of requiring the operator to remember flag names. All defaults
+are `No`; explicit flags always override any prompt. Step order is
+unchanged: exit-node is still applied last with probe + rollback;
+migrate still owns step 6b; addons still dispatch after core.
+
+Precedence for each optional choice (first match wins):
+
+1. `--yes` / `HOMELAB_NONINTERACTIVE=1` / non-TTY stdin → never prompt.
+2. Explicit flag for that option → no prompt.
+3. Already installed and runtime-healthy → silent skip.
+4. Interactive prompt (TTY only; `--interactive` forces it when
+   `--yes` is also set, but never overrides rule 1).
+5. Safe default (`false` / empty).
+
+`--interactive` is the only new flag and is documented in `--help`.
+The host-native restic addon has no interactive prompt by design —
+it is mutually exclusive with lobaro and a "yes" mid-bootstrap would
+land both schedulers. Use `--install-restic-host-native` (or
+`--migrate-from-host-native` to go the other way).
+
 ## Architecture
 
 The post-WP5 layout treats the lobaro container as the primary backup

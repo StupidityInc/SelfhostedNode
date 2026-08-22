@@ -1,5 +1,63 @@
 # Changes
 
+## 2026-08-22 (WP8)
+
+Interactive bootstrap UX — operators can now complete optional choices
+without remembering flag names, without losing the existing flag /
+non-interactive contract.
+
+`lib.sh`:
+
+- `homelab_is_tty` — pure TTY check, cheap to call.
+- `homelab_is_interactive` — true only when stdin is a TTY AND not
+  `HOMELAB_NONINTERACTIVE=1` AND not `HOMELAB_ASSUME_YES=true` (the
+  `--yes` substitute for subprocesses).
+- `homelab_ask PROMPT [DEFAULT]` — free-form question; echoes reply on
+  stdout. Non-interactive → echoes `$DEFAULT`. Empty / EOF → default.
+- `homelab_confirm PROMPT [DEFAULT]` — y/N confirmation; returns 0 on
+  yes. Non-interactive → returns based on `$DEFAULT` (`y` or `n`).
+  EOF → default.
+
+`bootstrap.sh`:
+
+- New flag `--interactive` — forces optional-choice prompts on a TTY
+  even when `--yes` was also passed. Has **no** effect under
+  `HOMELAB_NONINTERACTIVE=1` or a non-TTY stdin; the three non-interactive
+  guards always win. Explicit flags still override any prompt.
+- New phase `collect_optional_intent()` runs early (after role /
+  node-name resolution) but applies later — it only sets the existing
+  per-run `*_REQUESTED_THIS_RUN` variables and never side-effects.
+  Step order stays load-bearing: exit-node still applies last with
+  probe + rollback; migrate still owns step 6b; addons still dispatch
+  after core.
+- Prompts (defaults are all `N`):
+  - `Install cloudflared (Cloudflare Tunnel client)?` — server only.
+  - `Install Beszel agent?` — skipped when already deployed.
+  - `Advertise this node as a Tailscale exit node?` — server only;
+    suppressed on persisted `true` so re-runs do not toggle routing.
+  - `Use an exit node? (name or IP, empty for none)` — collected but
+    applied at step 8.
+  - `Migrate host-native restic → lobaro on this node?` — only when a
+    host-native timer is detected AND lobaro is not already running.
+- Host-native restic addon has **no** interactive prompt by design.
+  On a fresh node lobaro is not running yet when prompts run, so a
+  "yes" would land both schedulers and re-open the dual-path mess
+  F1/F2 closed. `--install-restic-host-native` stays as the only way
+  to opt in; `--migrate-from-host-native` is the reverse direction.
+- Re-run rule: persisted `INSTALL_*=true` AND runtime-healthy →
+  silent skip, no nag. Persisted but runtime-stale (the existing
+  staleness guards already rewrite the flag to `false`) → no prompt
+  either; the operator's "answer" is "install it" only via the
+  explicit flag.
+- `confirm()` is now a thin wrapper around `homelab_confirm` so
+  existing call sites (`Proceed with bootstrap?`, exit-node apply,
+  public-SSH lockdown) keep their y/N contract and gain the
+  `--interactive` semantics for free.
+- `--help` documents the precedence block and the new flag.
+
+No drive-by refactors. `addons/*`, `migrate-to-lobaro.sh`,
+`setup-restic.sh`, `check-node.sh` and `_system/*` were not touched.
+
 ## 2026-08-22 (WP7)
 
 Implemented WP7 — Migration Path (AGENT.md §3 WP7). One-shot helper

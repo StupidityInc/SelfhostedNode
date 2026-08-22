@@ -9,6 +9,62 @@ fi
 
 HOMELAB_GENERIC_NODE_NAMES="ubuntu debian localhost server client homelab node vps host linux default unknown"
 
+# True when stdin is a TTY. Stays cheap to call from any script.
+homelab_is_tty() { [[ -t 0 ]]; }
+
+# True when interactive prompting is appropriate: TTY AND not --yes AND
+# not HOMELAB_NONINTERACTIVE=1. bootstrap.sh sets HOMELAB_ASSUME_YES=true
+# when --yes is passed; the env override exists for tests / addons.
+homelab_is_interactive() {
+  [[ "${HOMELAB_NONINTERACTIVE:-0}" != "1" \
+    && "${HOMELAB_ASSUME_YES:-false}" != "true" ]] && homelab_is_tty
+}
+
+# Ask the operator a free-form question. Echoes the reply on stdout.
+# Non-interactive (no TTY, --yes, or HOMELAB_NONINTERACTIVE=1): echoes the
+# default and returns 0. Empty input → default. EOF → default. Suppress
+# the default-suffix when $default is empty.
+homelab_ask() {
+  local prompt="$1" default="${2:-}" reply
+  if ! homelab_is_interactive; then
+    printf '%s' "$default"
+    return 0
+  fi
+  if [[ -n "$default" ]]; then
+    if ! read -r -p "$prompt [$default]: " reply; then
+      printf '%s' "$default"
+      return 0
+    fi
+    [[ -z "$reply" ]] && reply="$default"
+  else
+    if ! read -r -p "$prompt: " reply; then
+      return 0
+    fi
+  fi
+  printf '%s' "$reply"
+}
+
+# Yes/no confirmation. $1 = prompt, $2 = default ('y' or 'n').
+# Returns 0 when the answer is yes, 1 otherwise. Non-interactive →
+# returns 0 when default=y, 1 when default=n. EOF / empty reply → default.
+homelab_confirm() {
+  local prompt="$1" default="${2:-n}" reply
+  if ! homelab_is_interactive; then
+    [[ "$default" =~ ^[Yy]$ ]]
+    return $?
+  fi
+  local suffix="[y/N]"
+  [[ "$default" =~ ^[Yy]$ ]] && suffix="[Y/n]"
+  if ! read -r -p "$prompt $suffix " reply; then
+    reply=""
+  fi
+  if [[ -z "$reply" ]]; then
+    [[ "$default" =~ ^[Yy]$ ]]
+    return $?
+  fi
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
 homelab_validate_node_name() {
   local name="$1" g
   [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || return 1

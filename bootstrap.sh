@@ -51,20 +51,140 @@ error() { log "ERROR $*"; exit 1; }
 
 NONINTERACTIVE="${HOMELAB_NONINTERACTIVE:-0}"
 ASSUME_YES="false"
+INTERACTIVE="false"
 
+# Force interactive prompts for optional choices even when --yes is set.
+# Has NO effect under HOMELAB_NONINTERACTIVE=1 or a non-TTY stdin — those
+# three non-interactive guards always win, by design. Explicit flags for a
+# given option still override any prompt.
 is_interactive() {
   [[ "$ASSUME_YES" != "true" && "$NONINTERACTIVE" != "1" && -t 0 ]]
 }
 
+# Thin wrapper so existing call sites (Proceed with bootstrap?,
+# exit-node apply, public-SSH lockdown) keep their y/N contract.
+# Bootstrap's local is_interactive() additionally honours --interactive,
+# which homelab_confirm() does not. The wrapper bridges that gap.
 confirm() {
-  local prompt="${1:-Continue?}"
-  if ! is_interactive; then
-    return 0
+  local prompt="${1:-Continue?}" default="${2:-n}"
+  if [[ "$ASSUME_YES" == "true" || "$NONINTERACTIVE" == "1" || ! -t 0 ]]; then
+    [[ "$default" =~ ^[Yy]$ ]]
+    return $?
   fi
-  local reply
-  read -r -p "$prompt [y/N] " reply
-  [[ "$reply" =~ ^[Yy]$ ]]
+  homelab_confirm "$prompt" "$default"
 }
+
+# Detect whether this node already has a live host-native restic timer
+# (and no running lobaro container). Used to decide whether the
+# host-native → lobaro migration prompt is appropriate. Mirrors the
+# staleness guard already applied to the persisted INSTALL_RESTIC_HOST_NATIVE
+# flag in the load phase: a timer that survived a previous run.
+host_native_timer_detected() {
+  $SUDO systemctl is-enabled restic-backup.timer >/dev/null 2>&1
+}
+
+# Collect the operator's intent for optional choices. Sets the same
+# per-run REQUESTED_THIS_RUN variables the explicit flags set. Runs
+# early (after role/node-name resolution) but applies later, so the
+# step order — exit-node last, migrate owns 6b, addons after core —
+# stays load-bearing. No side effects from this function.
+#
+# Precedence per option:
+#   1. explicit flag      → REQUESTED_THIS_RUN already true
+#   2. already installed  → silent skip (no prompt, no flag flip)
+#   3. interactive prompt → REQUESTED_THIS_RUN = (y/n)
+#   4. safe default       → false / empty
+collect_optional_intent() {
+  # 1) cloudflared (server only).
+  if [[ "$ROLE" == "server" \
+    && "$CLOUDFLARED_REQUESTED_THIS_RUN" != "true" \
+    && "$INSTALL_CLOUDFLARED" != "true" \
+    && ! cloudflared_is_usable \
+    && wants_optional_prompts ]]; then
+    if homelab_confirm "Install cloudflared (Cloudflare Tunnel client)?" n; then
+      CLOUDFLARED_REQUESTED_THIS_RUN="true"
+    fi
+  fi
+
+  # 2) Beszel agent. Skip when already running or the compose file exists.
+  if [[ "$BESZEL_AGENT_REQUESTED_THIS_RUN" != "true" \
+    && "$INSTALL_BESZEL_AGENT" != "true" \
+    && wants_optional_prompts ]]; then
+    if $SUDO docker ps -a --filter name=^beszel-agent$ --format '{{.Names}}' 2>/dev/null \
+         | grep -q '^beszel-agent$' \
+      || $SUDO test -f "/opt/stacks/beszel-agent/docker-compose.yml"; then
+      :   # already deployed; silent skip
+    elif homelab_confirm "Install Beszel agent?" n; then
+      BESZEL_AGENT_REQUESTED_THIS_RUN="true"
+    fi
+  fi
+
+  # NOTE: the host-native restic addon intentionally has NO interactive
+  # prompt. On a fresh node the lobaro container is not running yet when
+  # collect_optional_intent runs, so a "yes" would land both schedulers on
+  # the same node unless extra gating was added. Keep --install-restic-host-native
+  # as the only way to opt in, and let --migrate-from-host-native (with its
+  # own gate) carry the reverse direction.
+
+  # 3) Advertise exit node (server only). Skip when already advertised
+  #    via persisted state — re-running must not toggle this implicitly.
+  if [[ "$ROLE" == "server" \
+    && "$ADVERTISE_EXIT_NODE" != "true" \
+    && wants_optional_prompts ]]; then
+    if homelab_confirm "Advertise this node as a Tailscale exit node?" n; then
+      ADVERTISE_EXIT_NODE="true"
+    fi
+  fi
+
+  # 4) Use exit node. Skip on persisted state so a re-run does not flip
+  #    routing silently. The prompt is shown primarily for clients, but
+  #    we do not role-gate it (a server may legitimately want one).
+  if [[ -z "$USE_EXIT_NODE" && wants_optional_prompts ]]; then
+    local reply
+    reply="$(homelab_ask 'Use an exit node? (name or IP, empty for none)' '')"
+    if [[ -n "$reply" ]]; then
+      USE_EXIT_NODE="$reply"
+      info "Use-exit-node intent recorded: '$USE_EXIT_NODE' (applied later, after UFW + restic)"
+    fi
+  fi
+
+  # 5) Migrate host-native → lobaro. Only when the timer is detected AND
+  #    lobaro is not already running. Already-migrated nodes: silent skip.
+  if [[ "$MIGRATE_FROM_HOST_NATIVE_THIS_RUN" != "true" \
+    && wants_optional_prompts ]]; then
+    local lobaro_running="false"
+    if command -v docker >/dev/null 2>&1 \
+      && docker inspect -f '{{.State.Running}}' restic-backup 2>/dev/null \
+         | grep -q '^true$'; then
+      lobaro_running="true"
+    fi
+    if [[ "$lobaro_running" == "true" ]]; then
+      :   # already on lobaro; silent skip
+    elif host_native_timer_detected; then
+      if homelab_confirm "Migrate host-native restic → lobaro on this node?" n; then
+        MIGRATE_FROM_HOST_NATIVE_THIS_RUN="true"
+      fi
+    fi
+  fi
+}
+
+# Prompts optional choices on a TTY. Used by collect_optional_intent().
+# Defaults to off (no nag) on non-TTY stdin. Honors --interactive when a
+# TTY is available, but never overrides the three non-interactive guards.
+wants_optional_prompts() {
+  homelab_is_tty || return 1
+  [[ "$NONINTERACTIVE" == "1" ]] && return 1
+  if [[ "$ASSUME_YES" == "true" ]]; then
+    [[ "$INTERACTIVE" == "true" ]]
+    return $?
+  fi
+  return 0
+}
+
+# Make --yes visible to lib.sh helpers that live in subprocesses
+# (addons, setup-restic.sh) so their prompts follow the same rules.
+export HOMELAB_ASSUME_YES="false"
+[[ "$ASSUME_YES" == "true" ]] && export HOMELAB_ASSUME_YES="true"
 
 need_root_or_sudo() {
   if [[ $EUID -eq 0 ]]; then
@@ -354,7 +474,13 @@ Options:
   --public-ssh               Explicitly reopen/keep public SSH (overrides lockdown).
   --ts-authkey=KEY           Non-interactive Tailscale auth key (never logged)
   --yes                      Non-interactive: assume "yes" for confirmations
-                             (dangerous steps still need their explicit flags)
+                              (dangerous steps still need their explicit flags)
+  --interactive              Force interactive prompts for optional choices
+                              (cloudflared, Beszel, advertise/use exit node,
+                              host-native → lobaro migration). Has NO effect
+                              under --yes, HOMELAB_NONINTERACTIVE=1, or a
+                              non-TTY stdin — those three guards always win.
+                              Explicit flags still override any prompt.
   -h, --help                 Show this help
 
 Environment:
@@ -366,6 +492,13 @@ Environment:
   BESZEL_ALLOW_SAME_HOST_HUB_URL=true
                              Explicitly allow a non-Tailscale hub URL for a same-host hub
   HOMELAB_NONINTERACTIVE=1   Same as --yes
+
+Precedence for each optional choice (first match wins):
+  1. --yes / HOMELAB_NONINTERACTIVE=1 / non-TTY stdin  → never prompt
+  2. Explicit flag for that option                      → no prompt
+  3. Already installed and runtime-healthy              → silent skip
+  4. Interactive prompt (TTY only, --interactive forces it when --yes is set)
+  5. Safe default (false / empty)
 
 State persisted across runs: $NODE_ENV_FILE
 EOF
@@ -386,6 +519,7 @@ for arg in "$@"; do
     --public-ssh)          KEEP_PUBLIC_SSH="true" ;;
     --ts-authkey=*)        TS_AUTHKEY="${arg#*=}" ;;
     --yes)                 ASSUME_YES="true"; NONINTERACTIVE="1" ;;
+    --interactive)         INTERACTIVE="true" ;;
     -h|--help)             usage ;;
     *)                     error "Unknown argument: $arg" ;;
   esac
@@ -445,30 +579,11 @@ info "Node name : $NODE_NAME"
 info "Log file  : $LOG_FILE"
 echo
 
-if [[ "$INSTALL_BESZEL_AGENT" != "true" \
-  && "$BESZEL_AGENT_REQUESTED_THIS_RUN" != "true" \
-  && is_interactive ]]; then
-  if confirm "Install Beszel agent?"; then
-    BESZEL_AGENT_REQUESTED_THIS_RUN="true"
-  fi
-fi
-# Credential collection lives inside addons/beszel-agent/install.sh now
-# (WP5). bootstrap.sh only sets the request flag; the addon prompts for /
-# reads BESZEL_HUB_URL, BESZEL_AGENT_KEY, BESZEL_AGENT_TOKEN.
-
-# Symmetric prompt for the host-native restic addon. Skip when the lobaro
-# container is already running (the addon would refuse anyway, and the
-# user is unlikely to want to switch paths mid-bootstrap).
-if [[ "$INSTALL_RESTIC_HOST_NATIVE" != "true" \
-  && "${RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN:-false}" != "true" \
-  && is_interactive ]]; then
-  if command -v docker >/dev/null 2>&1 \
-    && docker inspect -f '{{.State.Running}}' restic-backup 2>/dev/null | grep -q '^true$'; then
-    info "Lobaro container detected; skipping the host-native restic prompt (mutually exclusive)."
-  elif confirm "Install host-native restic addon (mutually exclusive with lobaro)?"; then
-    RESTIC_HOST_NATIVE_REQUESTED_THIS_RUN="true"
-  fi
-fi
+# WP8: collect intent for all optional choices in one phase. Sets the same
+# per-run REQUESTED_THIS_RUN variables the explicit flags set. No side
+# effects — install paths still run at their correct steps (exit-node last,
+# migrate owns step 6b, addons after core).
+collect_optional_intent
 
 if ! confirm "Proceed with bootstrap?"; then
   info "Aborted by user"
