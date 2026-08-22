@@ -852,25 +852,37 @@ if [[ "$ROLE" == "server" && "$CLOUDFLARED_REQUESTED_THIS_RUN" == "true" ]]; the
 fi
 
 # ---------- 6. Restic setup ----------
+# Skipped on --migrate-from-host-native: step 6b's migrate-to-lobaro.sh owns
+# the deploy sequence (precondition check → pin repo-id → disable host-native
+# timer → reuse setup-restic.sh's REUSE_EXISTING branch → verify → persist
+# INSTALL_RESTIC_HOST_NATIVE=false). Running setup-restic.sh here would
+# double-deploy lobaro against an already-initialized repo on host-native nodes.
+#
 # On clients this may fail if S3 is only reachable via the exit node (which is
 # applied LAST, see below). In that case we defer and retry after the exit
 # node is up. On servers a failure stays fatal.
 RESTIC_OK="false"
-if [[ -f "$SCRIPT_DIR/setup-restic.sh" ]]; then
-  export NODE_NAME
-  export HOMELAB_NONINTERACTIVE="$NONINTERACTIVE"
-  info "Starting restic setup wizard..."
-  if bash "$SCRIPT_DIR/setup-restic.sh"; then
-    RESTIC_OK="true"
-  elif [[ "$ROLE" == "server" ]]; then
-    error "Restic setup failed. The rest of the bootstrap succeeded, but backups are not configured. You can re-run setup-restic.sh later."
-  else
-    warn "Restic setup failed (S3 may only be reachable via the exit node)."
-    warn "Will retry AFTER the exit node is enabled and verified."
-  fi
+if [[ "$MIGRATE_FROM_HOST_NATIVE_THIS_RUN" == "true" ]]; then
+  info "Skipping step 6 setup-restic.sh: --migrate-from-host-native delegates to migrate-to-lobaro.sh in step 6b."
+  # RESTIC_OK stays "false" — do not pretend step 6 ran. Step 6b is the
+  # authoritative deploy on this path.
 else
-  warn "setup-restic.sh not found next to bootstrap.sh – skipping automated restic setup"
-  info "You can run the restic wizard manually later."
+  if [[ -f "$SCRIPT_DIR/setup-restic.sh" ]]; then
+    export NODE_NAME
+    export HOMELAB_NONINTERACTIVE="$NONINTERACTIVE"
+    info "Starting restic setup wizard..."
+    if bash "$SCRIPT_DIR/setup-restic.sh"; then
+      RESTIC_OK="true"
+    elif [[ "$ROLE" == "server" ]]; then
+      error "Restic setup failed. The rest of the bootstrap succeeded, but backups are not configured. You can re-run setup-restic.sh later."
+    else
+      warn "Restic setup failed (S3 may only be reachable via the exit node)."
+      warn "Will retry AFTER the exit node is enabled and verified."
+    fi
+  else
+    warn "setup-restic.sh not found next to bootstrap.sh – skipping automated restic setup"
+    info "You can run the restic wizard manually later."
+  fi
 fi
 
 # ---------- 6b. Migration: host-native → lobaro (AGENT.md §3 WP7) ----------
@@ -974,8 +986,13 @@ if [[ "$ROLE" == "client" && -n "$USE_EXIT_NODE" ]]; then
     if [[ -n "$DIRECT_PUBLIC_IP_AT_SETUP" && "$NEW_PUBLIC_IP" == "$DIRECT_PUBLIC_IP_AT_SETUP" ]]; then
       warn "Public IP is identical to this node's own pre-exit-node IP – the exit node may not actually be routing traffic. Double-check in the admin console."
     fi
-    # Deferred restic retry (S3 only reachable via exit node)
-    if [[ "$RESTIC_OK" != "true" && -f "$SCRIPT_DIR/setup-restic.sh" ]]; then
+    # Deferred restic retry (S3 only reachable via exit node). Skipped on the
+    # --migrate-from-host-native path: step 6b's helper already deployed
+    # lobaro, so retrying setup-restic.sh here would re-run against an
+    # already-initialized repo.
+    if [[ "$RESTIC_OK" != "true" \
+      && "$MIGRATE_FROM_HOST_NATIVE_THIS_RUN" != "true" \
+      && -f "$SCRIPT_DIR/setup-restic.sh" ]]; then
       info "Retrying restic setup now that the exit node is active..."
       if bash "$SCRIPT_DIR/setup-restic.sh"; then
         RESTIC_OK="true"

@@ -308,12 +308,16 @@ homelab_backup_path() {
   fi
 
   # WP5 flag-precedence: when the operator (or addon installer) has
-  # persisted INSTALL_RESTIC_HOST_NATIVE=true, treat the host-native path
-  # as authoritative. The timer check above still runs, so a flag=true
-  # with a missing/disabled timer surfaces as 'host-native' — the caller
-  # (check-node.sh) then surfaces the missing timer as a separate FAIL.
-  if [[ "$flag_override" == "true" ]]; then
-    hostnative="true"
+  # persisted INSTALL_RESTIC_HOST_NATIVE=true, the host-native addon is
+  # what they want — but ONLY when the timer is actually enabled. A
+  # persisted flag pointing at a disabled timer is a failed deployment,
+  # not a healthy host-native install; returning 'none' here routes
+  # through check-node.sh's "no backup path active" FAIL (check-node.sh
+  # around line 272) so monitoring sees the broken state.
+  if [[ "$flag_override" == "true" && "$hostnative" == "true" ]]; then
+    :   # timer is live; flag agrees → host-native classification stands
+  elif [[ "$flag_override" == "true" ]]; then
+    hostnative="false"  # flag says host-native but timer is gone → fail
   fi
 
   case "$lobaro,$hostnative" in
